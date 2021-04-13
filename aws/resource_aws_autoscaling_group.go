@@ -363,6 +363,24 @@ func resourceAwsAutoscalingGroup() *schema.Resource {
 				Set:      schema.HashString,
 			},
 
+			"delete_per_machine_timeout": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
+					value := v.(string)
+					duration, err := time.ParseDuration(value)
+					if err != nil {
+						errors = append(errors, fmt.Errorf(
+							"%q cannot be parsed as a duration: %s", k, err))
+					}
+					if duration < 0 {
+						errors = append(errors, fmt.Errorf(
+							"%q must be greater than zero", k))
+					}
+					return
+				},
+			},
+
 			"metrics_granularity": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -1401,6 +1419,20 @@ func getAwsAutoscalingGroup(asgName string, conn *autoscaling.AutoScaling) (*aut
 	return nil, nil
 }
 
+func resourceAwsAutoscalingScaleDownToCount(d *schema.ResourceData, count int64, conn *autoscaling.AutoScaling) error {
+	log.Printf("[DEBUG] Reducing autoscaling group capacity to %d", count)
+	opts := autoscaling.UpdateAutoScalingGroupInput{
+		AutoScalingGroupName: aws.String(d.Id()),
+		MinSize:              aws.Int64(0),
+		DesiredCapacity:      aws.Int64(count),
+		MaxSize:              aws.Int64(count),
+	}
+	if _, err := conn.UpdateAutoScalingGroup(&opts); err != nil {
+		return fmt.Errorf("Error setting capacity to %d to drain: %s", count, err)
+	}
+	return nil
+}
+
 func resourceAwsAutoscalingGroupDrain(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).autoscalingconn
 
@@ -1420,9 +1452,45 @@ func resourceAwsAutoscalingGroupDrain(d *schema.ResourceData, meta interface{}) 
 	if _, err := conn.UpdateAutoScalingGroup(&opts); err != nil {
 		return fmt.Errorf("Error setting capacity to zero to drain: %s", err)
 	}
+	if delay, ok := d.GetOk("delete_per_machine_timeout"); ok {
+		g, err := getAwsAutoscalingGroup(d.Id(), conn)
+		if err != nil {
+			return err
+		}
+
+		delayDuration, err := time.ParseDuration(delay.(string))
+		if err != nil {
+			return err
+		}
+
+		count := *g.DesiredCapacity
+
+		for count > 0 {
+			count--
+			log.Printf("[INFO] AutoScaling Group scale down to %d: %v", count, d.Id())
+
+			if err := resourceAwsAutoscalingScaleDownToCount(d, count, conn); err != nil {
+				return err
+			}
+
+			// Wait for the scale-down to occur. Note that *each step* waits
+			// wait_for_capacity_timeout.
+			if err := waitForASGScaleDown(d, meta, int(count)); err != nil {
+				return err
+			}
+
+			if count != 0 {
+				time.Sleep(delayDuration)
+			}
+		}
+	} else {
+		if err := resourceAwsAutoscalingScaleDownToCount(d, 0, conn); err != nil {
+			return err
+		}
+	}
 
 	// Next, wait for the Auto Scaling Group to drain
-	log.Printf("[DEBUG] Waiting for group to have zero instances")
+	log.Printf("[DEBUG] Waiting for group to have 0 instances")
 	var g *autoscaling.Group
 	err := resource.Retry(d.Timeout(schema.TimeoutDelete), func() *resource.RetryError {
 		g, err := getAwsAutoscalingGroup(d.Id(), conn)

@@ -191,6 +191,23 @@ func resourceAwsAutoscalingGroup() *schema.Resource {
 				Optional: true,
 				Default:  "1Minute",
 			},
+			"delete_per_machine_timeout": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
+					value := v.(string)
+					duration, err := time.ParseDuration(value)
+					if err != nil {
+						errors = append(errors, fmt.Errorf(
+							"%q cannot be parsed as a duration: %s", k, err))
+					}
+					if duration < 0 {
+						errors = append(errors, fmt.Errorf(
+							"%q must be greater than zero", k))
+					}
+					return
+				},
+			},
 
 			"protect_from_scale_in": {
 				Type:     schema.TypeBool,

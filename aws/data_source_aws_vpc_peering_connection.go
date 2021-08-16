@@ -6,7 +6,8 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 func dataSourceAwsVpcPeeringConnection() *schema.Resource {
@@ -39,6 +40,11 @@ func dataSourceAwsVpcPeeringConnection() *schema.Resource {
 				Optional: true,
 				Computed: true,
 			},
+			"region": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
 			"peer_vpc_id": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -54,15 +60,20 @@ func dataSourceAwsVpcPeeringConnection() *schema.Resource {
 				Optional: true,
 				Computed: true,
 			},
+			"peer_region": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
 			"accepter": {
 				Type:     schema.TypeMap,
 				Computed: true,
-				Elem:     schema.TypeBool,
+				Elem:     &schema.Schema{Type: schema.TypeBool},
 			},
 			"requester": {
 				Type:     schema.TypeMap,
 				Computed: true,
-				Elem:     schema.TypeBool,
+				Elem:     &schema.Schema{Type: schema.TypeBool},
 			},
 			"filter": ec2CustomFiltersSchema(),
 			"tags":   tagsSchemaComputed(),
@@ -72,6 +83,7 @@ func dataSourceAwsVpcPeeringConnection() *schema.Resource {
 
 func dataSourceAwsVpcPeeringConnectionRead(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).ec2conn
+	ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
 
 	log.Printf("[DEBUG] Reading VPC Peering Connections.")
 
@@ -92,9 +104,13 @@ func dataSourceAwsVpcPeeringConnectionRead(d *schema.ResourceData, meta interfac
 			"accepter-vpc-info.cidr-block":  d.Get("peer_cidr_block").(string),
 		},
 	)
-	req.Filters = append(req.Filters, buildEC2TagFilterList(
-		tagsFromMap(d.Get("tags").(map[string]interface{})),
-	)...)
+
+	if tags, tagsOk := d.GetOk("tags"); tagsOk {
+		req.Filters = append(req.Filters, buildEC2TagFilterList(
+			keyvaluetags.New(tags.(map[string]interface{})).Ec2Tags(),
+		)...)
+	}
+
 	req.Filters = append(req.Filters, buildEC2CustomFilterList(
 		d.Get("filter").(*schema.Set),
 	)...)
@@ -103,6 +119,7 @@ func dataSourceAwsVpcPeeringConnectionRead(d *schema.ResourceData, meta interfac
 		req.Filters = nil
 	}
 
+	log.Printf("[DEBUG] Reading VPC Peering Connection: %s", req)
 	resp, err := conn.DescribeVpcPeeringConnections(req)
 	if err != nil {
 		return err
@@ -117,24 +134,27 @@ func dataSourceAwsVpcPeeringConnectionRead(d *schema.ResourceData, meta interfac
 	pcx := resp.VpcPeeringConnections[0]
 
 	d.SetId(aws.StringValue(pcx.VpcPeeringConnectionId))
-	d.Set("id", pcx.VpcPeeringConnectionId)
 	d.Set("status", pcx.Status.Code)
 	d.Set("vpc_id", pcx.RequesterVpcInfo.VpcId)
 	d.Set("owner_id", pcx.RequesterVpcInfo.OwnerId)
 	d.Set("cidr_block", pcx.RequesterVpcInfo.CidrBlock)
+	d.Set("region", pcx.RequesterVpcInfo.Region)
 	d.Set("peer_vpc_id", pcx.AccepterVpcInfo.VpcId)
 	d.Set("peer_owner_id", pcx.AccepterVpcInfo.OwnerId)
 	d.Set("peer_cidr_block", pcx.AccepterVpcInfo.CidrBlock)
-	d.Set("tags", tagsToMap(pcx.Tags))
+	d.Set("peer_region", pcx.AccepterVpcInfo.Region)
+	if err := d.Set("tags", keyvaluetags.Ec2KeyValueTags(pcx.Tags).IgnoreAws().IgnoreConfig(ignoreTagsConfig).Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
 
 	if pcx.AccepterVpcInfo.PeeringOptions != nil {
-		if err := d.Set("accepter", flattenPeeringOptions(pcx.AccepterVpcInfo.PeeringOptions)[0]); err != nil {
+		if err := d.Set("accepter", flattenVpcPeeringConnectionOptions(pcx.AccepterVpcInfo.PeeringOptions)[0]); err != nil {
 			return err
 		}
 	}
 
 	if pcx.RequesterVpcInfo.PeeringOptions != nil {
-		if err := d.Set("requester", flattenPeeringOptions(pcx.RequesterVpcInfo.PeeringOptions)[0]); err != nil {
+		if err := d.Set("requester", flattenVpcPeeringConnectionOptions(pcx.RequesterVpcInfo.PeeringOptions)[0]); err != nil {
 			return err
 		}
 	}

@@ -8,7 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 func dataSourceAwsDbSnapshot() *schema.Resource {
@@ -20,39 +20,33 @@ func dataSourceAwsDbSnapshot() *schema.Resource {
 			"db_instance_identifier": {
 				Type:     schema.TypeString,
 				Optional: true,
-				ForceNew: true,
 			},
 
 			"db_snapshot_identifier": {
 				Type:     schema.TypeString,
 				Optional: true,
-				ForceNew: true,
 			},
 
 			"snapshot_type": {
 				Type:     schema.TypeString,
 				Optional: true,
-				ForceNew: true,
 			},
 
 			"include_shared": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				ForceNew: true,
 				Default:  false,
 			},
 
 			"include_public": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				ForceNew: true,
 				Default:  false,
 			},
 			"most_recent": {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  false,
-				ForceNew: true,
 			},
 
 			//Computed values returned
@@ -152,6 +146,7 @@ func dataSourceAwsDbSnapshotRead(d *schema.ResourceData, meta interface{}) error
 		params.DBSnapshotIdentifier = aws.String(snapshotIdentifier.(string))
 	}
 
+	log.Printf("[DEBUG] Reading DB Snapshot: %s", params)
 	resp, err := conn.DescribeDBSnapshots(params)
 	if err != nil {
 		return err
@@ -182,6 +177,14 @@ type rdsSnapshotSort []*rds.DBSnapshot
 func (a rdsSnapshotSort) Len() int      { return len(a) }
 func (a rdsSnapshotSort) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a rdsSnapshotSort) Less(i, j int) bool {
+	// Snapshot creation can be in progress
+	if a[i].SnapshotCreateTime == nil {
+		return true
+	}
+	if a[j].SnapshotCreateTime == nil {
+		return false
+	}
+
 	return (*a[i].SnapshotCreateTime).Before(*a[j].SnapshotCreateTime)
 }
 
@@ -192,10 +195,11 @@ func mostRecentDbSnapshot(snapshots []*rds.DBSnapshot) *rds.DBSnapshot {
 }
 
 func dbSnapshotDescriptionAttributes(d *schema.ResourceData, snapshot *rds.DBSnapshot) error {
-	d.SetId(*snapshot.DBSnapshotIdentifier)
+	d.SetId(aws.StringValue(snapshot.DBSnapshotIdentifier))
 	d.Set("db_instance_identifier", snapshot.DBInstanceIdentifier)
 	d.Set("db_snapshot_identifier", snapshot.DBSnapshotIdentifier)
 	d.Set("snapshot_type", snapshot.SnapshotType)
+	d.Set("storage_type", snapshot.StorageType)
 	d.Set("allocated_storage", snapshot.AllocatedStorage)
 	d.Set("availability_zone", snapshot.AvailabilityZone)
 	d.Set("db_snapshot_arn", snapshot.DBSnapshotArn)
@@ -211,7 +215,9 @@ func dbSnapshotDescriptionAttributes(d *schema.ResourceData, snapshot *rds.DBSna
 	d.Set("source_region", snapshot.SourceRegion)
 	d.Set("status", snapshot.Status)
 	d.Set("vpc_id", snapshot.VpcId)
-	d.Set("snapshot_create_time", snapshot.SnapshotCreateTime.Format(time.RFC3339))
+	if snapshot.SnapshotCreateTime != nil {
+		d.Set("snapshot_create_time", snapshot.SnapshotCreateTime.Format(time.RFC3339))
+	}
 
 	return nil
 }

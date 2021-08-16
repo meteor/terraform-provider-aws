@@ -3,21 +3,21 @@ package aws
 import (
 	"encoding/base64"
 	"log"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/kms"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
-func dataSourceAwsKmsCiphetext() *schema.Resource {
+func dataSourceAwsKmsCiphertext() *schema.Resource {
 	return &schema.Resource{
-		Read: dataSourceAwsKmsCiphetextRead,
+		Read: dataSourceAwsKmsCiphertextRead,
 
 		Schema: map[string]*schema.Schema{
 			"plaintext": {
-				Type:     schema.TypeString,
-				Required: true,
+				Type:      schema.TypeString,
+				Required:  true,
+				Sensitive: true,
 			},
 
 			"key_id": {
@@ -25,7 +25,7 @@ func dataSourceAwsKmsCiphetext() *schema.Resource {
 				Required: true,
 			},
 
-			"context": &schema.Schema{
+			"context": {
 				Type:     schema.TypeMap,
 				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
@@ -39,10 +39,8 @@ func dataSourceAwsKmsCiphetext() *schema.Resource {
 	}
 }
 
-func dataSourceAwsKmsCiphetextRead(d *schema.ResourceData, meta interface{}) error {
+func dataSourceAwsKmsCiphertextRead(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).kmsconn
-
-	d.SetId(time.Now().UTC().String())
 
 	req := &kms.EncryptInput{
 		KeyId:     aws.String(d.Get("key_id").(string)),
@@ -54,11 +52,12 @@ func dataSourceAwsKmsCiphetextRead(d *schema.ResourceData, meta interface{}) err
 	}
 
 	log.Printf("[DEBUG] KMS encrypt for key: %s", d.Get("key_id").(string))
-
 	resp, err := conn.Encrypt(req)
 	if err != nil {
 		return err
 	}
+
+	d.SetId(aws.StringValue(resp.KeyId))
 
 	d.Set("ciphertext_blob", base64.StdEncoding.EncodeToString(resp.CiphertextBlob))
 

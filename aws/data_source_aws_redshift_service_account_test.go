@@ -3,24 +3,43 @@ package aws
 import (
 	"testing"
 
-	"github.com/hashicorp/terraform/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 )
 
 func TestAccAWSRedshiftServiceAccount_basic(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	expectedAccountID := redshiftServiceAccountPerRegionMap[testAccGetRegion()]
+
+	dataSourceName := "data.aws_redshift_service_account.main"
+
+	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:  func() { testAccPreCheck(t) },
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
-			resource.TestStep{
+			{
 				Config: testAccCheckAwsRedshiftServiceAccountConfig,
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("data.aws_redshift_service_account.main", "id", "902366379725"),
+					resource.TestCheckResourceAttr(dataSourceName, "id", expectedAccountID),
+					testAccCheckResourceAttrGlobalARNAccountID(dataSourceName, "arn", expectedAccountID, "iam", "user/logs"),
 				),
 			},
-			resource.TestStep{
+		},
+	})
+}
+
+func TestAccAWSRedshiftServiceAccount_Region(t *testing.T) {
+	expectedAccountID := redshiftServiceAccountPerRegionMap[testAccGetRegion()]
+
+	dataSourceName := "data.aws_redshift_service_account.regional"
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
 				Config: testAccCheckAwsRedshiftServiceAccountExplicitRegionConfig,
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("data.aws_redshift_service_account.regional", "id", "210876761215"),
+					resource.TestCheckResourceAttr(dataSourceName, "id", expectedAccountID),
+					testAccCheckResourceAttrGlobalARNAccountID(dataSourceName, "arn", expectedAccountID, "iam", "user/logs"),
 				),
 			},
 		},
@@ -28,11 +47,13 @@ func TestAccAWSRedshiftServiceAccount_basic(t *testing.T) {
 }
 
 const testAccCheckAwsRedshiftServiceAccountConfig = `
-data "aws_redshift_service_account" "main" { }
+data "aws_redshift_service_account" "main" {}
 `
 
 const testAccCheckAwsRedshiftServiceAccountExplicitRegionConfig = `
+data "aws_region" "current" {}
+
 data "aws_redshift_service_account" "regional" {
-	region = "eu-west-1"
+  region = data.aws_region.current.name
 }
 `

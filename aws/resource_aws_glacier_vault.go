@@ -6,12 +6,13 @@ import (
 	"log"
 	"regexp"
 
-	"github.com/hashicorp/errwrap"
-	"github.com/hashicorp/terraform/helper/schema"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/glacier"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/structure"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 func resourceAwsGlacierVault() *schema.Resource {
@@ -26,7 +27,7 @@ func resourceAwsGlacierVault() *schema.Resource {
 		},
 
 		Schema: map[string]*schema.Schema{
-			"name": &schema.Schema{
+			"name": {
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
@@ -44,38 +45,38 @@ func resourceAwsGlacierVault() *schema.Resource {
 				},
 			},
 
-			"location": &schema.Schema{
+			"location": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"arn": &schema.Schema{
+			"arn": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"access_policy": &schema.Schema{
+			"access_policy": {
 				Type:         schema.TypeString,
 				Optional:     true,
-				ValidateFunc: validateJsonString,
+				ValidateFunc: validation.StringIsJSON,
 				StateFunc: func(v interface{}) string {
-					json, _ := normalizeJsonString(v)
+					json, _ := structure.NormalizeJsonString(v)
 					return json
 				},
 			},
 
-			"notification": &schema.Schema{
+			"notification": {
 				Type:     schema.TypeList,
 				Optional: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
-						"events": &schema.Schema{
+						"events": {
 							Type:     schema.TypeSet,
 							Required: true,
 							Elem:     &schema.Schema{Type: schema.TypeString},
 							Set:      schema.HashString,
 						},
-						"sns_topic": &schema.Schema{
+						"sns_topic": {
 							Type:     schema.TypeString,
 							Required: true,
 						},
@@ -101,7 +102,7 @@ func resourceAwsGlacierVaultCreate(d *schema.ResourceData, meta interface{}) err
 	}
 
 	d.SetId(d.Get("name").(string))
-	d.Set("location", *out.Location)
+	d.Set("location", out.Location)
 
 	return resourceAwsGlacierVaultUpdate(d, meta)
 }
@@ -109,8 +110,11 @@ func resourceAwsGlacierVaultCreate(d *schema.ResourceData, meta interface{}) err
 func resourceAwsGlacierVaultUpdate(d *schema.ResourceData, meta interface{}) error {
 	glacierconn := meta.(*AWSClient).glacierconn
 
-	if err := setGlacierVaultTags(glacierconn, d); err != nil {
-		return err
+	if d.HasChange("tags") {
+		o, n := d.GetChange("tags")
+		if err := keyvaluetags.GlacierUpdateTags(glacierconn, d.Id(), o, n); err != nil {
+			return fmt.Errorf("error updating Glacier Vault (%s) tags: %s", d.Id(), err)
+		}
 	}
 
 	if d.HasChange("access_policy") {
@@ -130,6 +134,7 @@ func resourceAwsGlacierVaultUpdate(d *schema.ResourceData, meta interface{}) err
 
 func resourceAwsGlacierVaultRead(d *schema.ResourceData, meta interface{}) error {
 	glacierconn := meta.(*AWSClient).glacierconn
+	ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
 
 	input := &glacier.DescribeVaultInput{
 		VaultName: aws.String(d.Id()),
@@ -150,11 +155,15 @@ func resourceAwsGlacierVaultRead(d *schema.ResourceData, meta interface{}) error
 	}
 	d.Set("location", location)
 
-	tags, err := getGlacierVaultTags(glacierconn, d.Id())
+	tags, err := keyvaluetags.GlacierListTags(glacierconn, d.Id())
+
 	if err != nil {
-		return err
+		return fmt.Errorf("error listing tags for Glacier Vault (%s): %s", d.Id(), err)
 	}
-	d.Set("tags", tags)
+
+	if err := d.Set("tags", tags.IgnoreAws().IgnoreConfig(ignoreTagsConfig).Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
 
 	log.Printf("[DEBUG] Getting the access_policy for Vault %s", d.Id())
 	pol, err := glacierconn.GetVaultAccessPolicy(&glacier.GetVaultAccessPolicyInput{
@@ -164,9 +173,9 @@ func resourceAwsGlacierVaultRead(d *schema.ResourceData, meta interface{}) error
 	if awserr, ok := err.(awserr.Error); ok && awserr.Code() == "ResourceNotFoundException" {
 		d.Set("access_policy", "")
 	} else if pol != nil {
-		policy, err := normalizeJsonString(*pol.Policy.Policy)
+		policy, err := structure.NormalizeJsonString(*pol.Policy.Policy)
 		if err != nil {
-			return errwrap.Wrapf("access policy contains an invalid JSON: {{err}}", err)
+			return fmt.Errorf("access policy contains an invalid JSON: %s", err)
 		}
 		d.Set("access_policy", policy)
 	} else {
@@ -271,123 +280,6 @@ func resourceAwsGlacierVaultPolicyUpdate(glacierconn *glacier.Glacier, d *schema
 	return nil
 }
 
-func setGlacierVaultTags(conn *glacier.Glacier, d *schema.ResourceData) error {
-	if d.HasChange("tags") {
-		oraw, nraw := d.GetChange("tags")
-		o := oraw.(map[string]interface{})
-		n := nraw.(map[string]interface{})
-		create, remove := diffGlacierVaultTags(mapGlacierVaultTags(o), mapGlacierVaultTags(n))
-
-		// Set tags
-		if len(remove) > 0 {
-			tagsToRemove := &glacier.RemoveTagsFromVaultInput{
-				VaultName: aws.String(d.Id()),
-				TagKeys:   glacierStringsToPointyString(remove),
-			}
-
-			log.Printf("[DEBUG] Removing tags: from %s", d.Id())
-			_, err := conn.RemoveTagsFromVault(tagsToRemove)
-			if err != nil {
-				return err
-			}
-		}
-		if len(create) > 0 {
-			tagsToAdd := &glacier.AddTagsToVaultInput{
-				VaultName: aws.String(d.Id()),
-				Tags:      glacierVaultTagsFromMap(create),
-			}
-
-			log.Printf("[DEBUG] Creating tags: for %s", d.Id())
-			_, err := conn.AddTagsToVault(tagsToAdd)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func mapGlacierVaultTags(m map[string]interface{}) map[string]string {
-	results := make(map[string]string)
-	for k, v := range m {
-		results[k] = v.(string)
-	}
-
-	return results
-}
-
-func diffGlacierVaultTags(oldTags, newTags map[string]string) (map[string]string, []string) {
-
-	create := make(map[string]string)
-	for k, v := range newTags {
-		create[k] = v
-	}
-
-	// Build the list of what to remove
-	var remove []string
-	for k, v := range oldTags {
-		old, ok := create[k]
-		if !ok || old != v {
-			// Delete it!
-			remove = append(remove, k)
-		}
-	}
-
-	return create, remove
-}
-
-func getGlacierVaultTags(glacierconn *glacier.Glacier, vaultName string) (map[string]string, error) {
-	request := &glacier.ListTagsForVaultInput{
-		VaultName: aws.String(vaultName),
-	}
-
-	log.Printf("[DEBUG] Getting the tags: for %s", vaultName)
-	response, err := glacierconn.ListTagsForVault(request)
-	if awserr, ok := err.(awserr.Error); ok && awserr.Code() == "NoSuchTagSet" {
-		return map[string]string{}, nil
-	} else if err != nil {
-		return nil, err
-	}
-
-	return glacierVaultTagsToMap(response.Tags), nil
-}
-
-func glacierVaultTagsToMap(responseTags map[string]*string) map[string]string {
-	results := make(map[string]string, len(responseTags))
-	for k, v := range responseTags {
-		results[k] = *v
-	}
-
-	return results
-}
-
-func glacierVaultTagsFromMap(responseTags map[string]string) map[string]*string {
-	results := make(map[string]*string, len(responseTags))
-	for k, v := range responseTags {
-		results[k] = aws.String(v)
-	}
-
-	return results
-}
-
-func glacierStringsToPointyString(s []string) []*string {
-	results := make([]*string, len(s))
-	for i, x := range s {
-		results[i] = aws.String(x)
-	}
-
-	return results
-}
-
-func glacierPointersToStringList(pointers []*string) []interface{} {
-	list := make([]interface{}, len(pointers))
-	for i, v := range pointers {
-		list[i] = *v
-	}
-	return list
-}
-
 func buildGlacierVaultLocation(accountId, vaultName string) (string, error) {
 	if accountId == "" {
 		return "", errors.New("AWS account ID unavailable - failed to construct Vault location")
@@ -405,12 +297,12 @@ func getGlacierVaultNotification(glacierconn *glacier.Glacier, vaultName string)
 		return nil, fmt.Errorf("Error reading Glacier Vault Notifications: %s", err.Error())
 	}
 
-	notifications := make(map[string]interface{}, 0)
+	notifications := make(map[string]interface{})
 
 	log.Print("[DEBUG] Flattening Glacier Vault Notifications")
 
-	notifications["events"] = schema.NewSet(schema.HashString, glacierPointersToStringList(response.VaultNotificationConfig.Events))
-	notifications["sns_topic"] = *response.VaultNotificationConfig.SNSTopic
+	notifications["events"] = aws.StringValueSlice(response.VaultNotificationConfig.Events)
+	notifications["sns_topic"] = aws.StringValue(response.VaultNotificationConfig.SNSTopic)
 
 	return []map[string]interface{}{notifications}, nil
 }

@@ -6,7 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 func resourceAwsIamGroupMembership() *schema.Resource {
@@ -17,20 +17,20 @@ func resourceAwsIamGroupMembership() *schema.Resource {
 		Delete: resourceAwsIamGroupMembershipDelete,
 
 		Schema: map[string]*schema.Schema{
-			"name": &schema.Schema{
+			"name": {
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
 			},
 
-			"users": &schema.Schema{
+			"users": {
 				Type:     schema.TypeSet,
 				Required: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
 
-			"group": &schema.Schema{
+			"group": {
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
@@ -43,7 +43,7 @@ func resourceAwsIamGroupMembershipCreate(d *schema.ResourceData, meta interface{
 	conn := meta.(*AWSClient).iamconn
 
 	group := d.Get("group").(string)
-	userList := expandStringList(d.Get("users").(*schema.Set).List())
+	userList := expandStringSet(d.Get("users").(*schema.Set))
 
 	if err := addUsersToGroup(conn, userList, group); err != nil {
 		return err
@@ -88,7 +88,7 @@ func resourceAwsIamGroupMembershipRead(d *schema.ResourceData, meta interface{})
 	}
 
 	if err := d.Set("users", ul); err != nil {
-		return fmt.Errorf("[WARN] Error setting user list from IAM Group Membership (%s), error: %s", group, err)
+		return fmt.Errorf("Error setting user list from IAM Group Membership (%s), error: %s", group, err)
 	}
 
 	return nil
@@ -110,8 +110,8 @@ func resourceAwsIamGroupMembershipUpdate(d *schema.ResourceData, meta interface{
 
 		os := o.(*schema.Set)
 		ns := n.(*schema.Set)
-		remove := expandStringList(os.Difference(ns).List())
-		add := expandStringList(ns.Difference(os).List())
+		remove := expandStringSet(os.Difference(ns))
+		add := expandStringSet(ns.Difference(os))
 
 		if err := removeUsersFromGroup(conn, remove, group); err != nil {
 			return err
@@ -127,14 +127,11 @@ func resourceAwsIamGroupMembershipUpdate(d *schema.ResourceData, meta interface{
 
 func resourceAwsIamGroupMembershipDelete(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).iamconn
-	userList := expandStringList(d.Get("users").(*schema.Set).List())
+	userList := expandStringSet(d.Get("users").(*schema.Set))
 	group := d.Get("group").(string)
 
-	if err := removeUsersFromGroup(conn, userList, group); err != nil {
-		return err
-	}
-
-	return nil
+	err := removeUsersFromGroup(conn, userList, group)
+	return err
 }
 
 func removeUsersFromGroup(conn *iam.IAM, users []*string, group string) error {

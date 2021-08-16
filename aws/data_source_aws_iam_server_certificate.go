@@ -2,13 +2,16 @@ package aws
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/hashicorp/errwrap"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
 func dataSourceAwsIAMServerCertificate() *schema.Resource {
@@ -20,45 +23,29 @@ func dataSourceAwsIAMServerCertificate() *schema.Resource {
 				Type:          schema.TypeString,
 				Optional:      true,
 				Computed:      true,
-				ForceNew:      true,
 				ConflictsWith: []string{"name_prefix"},
-				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-					value := v.(string)
-					if len(value) > 128 {
-						errors = append(errors, fmt.Errorf(
-							"%q cannot be longer than 128 characters", k))
-					}
-					return
-				},
+				ValidateFunc:  validation.StringLenBetween(0, 128),
 			},
 
 			"name_prefix": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				ConflictsWith: []string{"name"},
+				ValidateFunc:  validation.StringLenBetween(0, 128-resource.UniqueIDSuffixLength),
+			},
+
+			"path_prefix": {
 				Type:     schema.TypeString,
 				Optional: true,
-				ForceNew: true,
-				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-					value := v.(string)
-					if len(value) > 102 {
-						errors = append(errors, fmt.Errorf(
-							"%q cannot be longer than 102 characters, name is limited to 128", k))
-					}
-					return
-				},
 			},
 
 			"latest": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				ForceNew: true,
 				Default:  false,
 			},
 
 			"arn": {
-				Type:     schema.TypeString,
-				Computed: true,
-			},
-
-			"id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -69,6 +56,21 @@ func dataSourceAwsIAMServerCertificate() *schema.Resource {
 			},
 
 			"expiration_date": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"upload_date": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"certificate_body": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"certificate_chain": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -102,8 +104,13 @@ func dataSourceAwsIAMServerCertificateRead(d *schema.ResourceData, meta interfac
 		}
 	}
 
-	var metadatas = []*iam.ServerCertificateMetadata{}
-	err := iamconn.ListServerCertificatesPages(&iam.ListServerCertificatesInput{}, func(p *iam.ListServerCertificatesOutput, lastPage bool) bool {
+	var metadatas []*iam.ServerCertificateMetadata
+	input := &iam.ListServerCertificatesInput{}
+	if v, ok := d.GetOk("path_prefix"); ok {
+		input.PathPrefix = aws.String(v.(string))
+	}
+	log.Printf("[DEBUG] Reading IAM Server Certificate")
+	err := iamconn.ListServerCertificatesPages(input, func(p *iam.ListServerCertificatesOutput, lastPage bool) bool {
 		for _, cert := range p.ServerCertificateMetadataList {
 			if matcher(cert) {
 				metadatas = append(metadatas, cert)
@@ -112,7 +119,7 @@ func dataSourceAwsIAMServerCertificateRead(d *schema.ResourceData, meta interfac
 		return true
 	})
 	if err != nil {
-		return errwrap.Wrapf("Error describing certificates: {{err}}", err)
+		return fmt.Errorf("Error describing certificates: %s", err)
 	}
 
 	if len(metadatas) == 0 {
@@ -127,14 +134,24 @@ func dataSourceAwsIAMServerCertificateRead(d *schema.ResourceData, meta interfac
 	}
 
 	metadata := metadatas[0]
-	d.SetId(*metadata.ServerCertificateId)
-	d.Set("arn", *metadata.Arn)
-	d.Set("path", *metadata.Path)
-	d.Set("id", *metadata.ServerCertificateId)
-	d.Set("name", *metadata.ServerCertificateName)
+	d.SetId(aws.StringValue(metadata.ServerCertificateId))
+	d.Set("arn", metadata.Arn)
+	d.Set("path", metadata.Path)
+	d.Set("name", metadata.ServerCertificateName)
 	if metadata.Expiration != nil {
-		d.Set("expiration_date", metadata.Expiration.Format("2006-01-02T15:04:05"))
+		d.Set("expiration_date", metadata.Expiration.Format(time.RFC3339))
 	}
+
+	log.Printf("[DEBUG] Get Public Key Certificate for %s", *metadata.ServerCertificateName)
+	serverCertificateResp, err := iamconn.GetServerCertificate(&iam.GetServerCertificateInput{
+		ServerCertificateName: metadata.ServerCertificateName,
+	})
+	if err != nil {
+		return err
+	}
+	d.Set("upload_date", serverCertificateResp.ServerCertificate.ServerCertificateMetadata.UploadDate.Format(time.RFC3339))
+	d.Set("certificate_body", aws.StringValue(serverCertificateResp.ServerCertificate.CertificateBody))
+	d.Set("certificate_chain", aws.StringValue(serverCertificateResp.ServerCertificate.CertificateChain))
 
 	return nil
 }

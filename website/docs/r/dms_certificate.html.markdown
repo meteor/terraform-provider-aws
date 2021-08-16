@@ -1,17 +1,17 @@
 ---
+subcategory: "Database Migration Service (DMS)"
 layout: "aws"
 page_title: "AWS: aws_dms_certificate"
-sidebar_current: "docs-aws-resource-dms-certificate"
 description: |-
   Provides a DMS (Data Migration Service) certificate resource.
 ---
 
-# aws\_dms\_certificate
+# Resource: aws_dms_certificate
 
 Provides a DMS (Data Migration Service) certificate resource. DMS certificates can be created, deleted, and imported.
 
 ~> **Note:** All arguments including the PEM encoded certificate will be stored in the raw state as plain-text.
-[Read more about sensitive data in state](/docs/state/sensitive-data.html).
+[Read more about sensitive data in state](https://www.terraform.io/docs/state/sensitive-data.html).
 
 ## Example Usage
 
@@ -36,7 +36,7 @@ The following arguments are supported:
 
 ## Attributes Reference
 
-The following attributes are exported:
+In addition to all arguments above, the following attributes are exported:
 
 * `certificate_arn` - The Amazon Resource Name (ARN) for the certificate.
 

@@ -5,14 +5,17 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/service/elb"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
 func resourceAwsIAMServerCertificate() *schema.Resource {
@@ -26,17 +29,19 @@ func resourceAwsIAMServerCertificate() *schema.Resource {
 
 		Schema: map[string]*schema.Schema{
 			"certificate_body": {
-				Type:      schema.TypeString,
-				Required:  true,
-				ForceNew:  true,
-				StateFunc: normalizeCert,
+				Type:             schema.TypeString,
+				Required:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressNormalizeCertRemoval,
+				StateFunc:        StateTrimSpace,
 			},
 
 			"certificate_chain": {
-				Type:      schema.TypeString,
-				Optional:  true,
-				ForceNew:  true,
-				StateFunc: normalizeCert,
+				Type:             schema.TypeString,
+				Optional:         true,
+				ForceNew:         true,
+				DiffSuppressFunc: suppressNormalizeCertRemoval,
+				StateFunc:        StateTrimSpace,
 			},
 
 			"path": {
@@ -47,11 +52,12 @@ func resourceAwsIAMServerCertificate() *schema.Resource {
 			},
 
 			"private_key": {
-				Type:      schema.TypeString,
-				Required:  true,
-				ForceNew:  true,
-				StateFunc: normalizeCert,
-				Sensitive: true,
+				Type:             schema.TypeString,
+				Required:         true,
+				ForceNew:         true,
+				Sensitive:        true,
+				DiffSuppressFunc: suppressNormalizeCertRemoval,
+				StateFunc:        StateTrimSpace,
 			},
 
 			"name": {
@@ -60,28 +66,15 @@ func resourceAwsIAMServerCertificate() *schema.Resource {
 				Computed:      true,
 				ForceNew:      true,
 				ConflictsWith: []string{"name_prefix"},
-				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-					value := v.(string)
-					if len(value) > 128 {
-						errors = append(errors, fmt.Errorf(
-							"%q cannot be longer than 128 characters", k))
-					}
-					return
-				},
+				ValidateFunc:  validation.StringLenBetween(0, 128),
 			},
 
 			"name_prefix": {
-				Type:     schema.TypeString,
-				Optional: true,
-				ForceNew: true,
-				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-					value := v.(string)
-					if len(value) > 102 {
-						errors = append(errors, fmt.Errorf(
-							"%q cannot be longer than 102 characters, name is limited to 128", k))
-					}
-					return
-				},
+				Type:          schema.TypeString,
+				Optional:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{"name"},
+				ValidateFunc:  validation.StringLenBetween(0, 128-resource.UniqueIDSuffixLength),
 			},
 
 			"arn": {
@@ -122,13 +115,10 @@ func resourceAwsIAMServerCertificateCreate(d *schema.ResourceData, meta interfac
 	log.Printf("[DEBUG] Creating IAM Server Certificate with opts: %s", createOpts)
 	resp, err := conn.UploadServerCertificate(createOpts)
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			return fmt.Errorf("[WARN] Error uploading server certificate, error: %s: %s", awsErr.Code(), awsErr.Message())
-		}
-		return fmt.Errorf("[WARN] Error uploading server certificate, error: %s", err)
+		return fmt.Errorf("error uploading server certificate: %w", err)
 	}
 
-	d.SetId(*resp.ServerCertificateMetadata.ServerCertificateId)
+	d.SetId(aws.StringValue(resp.ServerCertificateMetadata.ServerCertificateId))
 	d.Set("name", sslCertName)
 
 	return resourceAwsIAMServerCertificateRead(d, meta)
@@ -140,29 +130,20 @@ func resourceAwsIAMServerCertificateRead(d *schema.ResourceData, meta interface{
 		ServerCertificateName: aws.String(d.Get("name").(string)),
 	})
 
+	if isAWSErr(err, iam.ErrCodeNoSuchEntityException, "") {
+		log.Printf("[WARN] IAM Server Certificate (%s) not found, removing from state", d.Id())
+		d.SetId("")
+		return nil
+	}
+
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if awsErr.Code() == "NoSuchEntity" {
-				log.Printf("[WARN] IAM Server Cert (%s) not found, removing from state", d.Id())
-				d.SetId("")
-				return nil
-			}
-			return fmt.Errorf("[WARN] Error reading IAM Server Certificate: %s: %s", awsErr.Code(), awsErr.Message())
-		}
-		return fmt.Errorf("[WARN] Error reading IAM Server Certificate: %s", err)
+		return fmt.Errorf("error reading IAM Server Certificate (%s): %w", d.Id(), err)
 	}
 
-	d.SetId(*resp.ServerCertificate.ServerCertificateMetadata.ServerCertificateId)
+	d.SetId(aws.StringValue(resp.ServerCertificate.ServerCertificateMetadata.ServerCertificateId))
 
-	// these values should always be present, and have a default if not set in
-	// configuration, and so safe to reference with nil checks
-	d.Set("certificate_body", normalizeCert(resp.ServerCertificate.CertificateBody))
-
-	c := normalizeCert(resp.ServerCertificate.CertificateChain)
-	if c != "" {
-		d.Set("certificate_chain", c)
-	}
-
+	d.Set("certificate_body", resp.ServerCertificate.CertificateBody)
+	d.Set("certificate_chain", resp.ServerCertificate.CertificateChain)
 	d.Set("path", resp.ServerCertificate.ServerCertificateMetadata.Path)
 	d.Set("arn", resp.ServerCertificate.ServerCertificateMetadata.Arn)
 
@@ -180,12 +161,11 @@ func resourceAwsIAMServerCertificateDelete(d *schema.ResourceData, meta interfac
 		if err != nil {
 			if awsErr, ok := err.(awserr.Error); ok {
 				if awsErr.Code() == "DeleteConflict" && strings.Contains(awsErr.Message(), "currently in use by arn") {
+					currentlyInUseBy(awsErr.Message(), meta.(*AWSClient).elbconn)
 					log.Printf("[WARN] Conflict deleting server certificate: %s, retrying", awsErr.Message())
 					return resource.RetryableError(err)
 				}
 				if awsErr.Code() == "NoSuchEntity" {
-					log.Printf("[WARN] IAM Server Certificate (%s) not found, removing from state", d.Id())
-					d.SetId("")
 					return nil
 				}
 			}
@@ -194,12 +174,13 @@ func resourceAwsIAMServerCertificateDelete(d *schema.ResourceData, meta interfac
 		return nil
 	})
 
-	if err != nil {
-		return err
+	if isResourceTimeoutError(err) {
+		_, err = conn.DeleteServerCertificate(&iam.DeleteServerCertificateInput{
+			ServerCertificateName: aws.String(d.Get("name").(string)),
+		})
 	}
 
-	d.SetId("")
-	return nil
+	return err
 }
 
 func resourceAwsIAMServerCertificateImport(
@@ -209,17 +190,33 @@ func resourceAwsIAMServerCertificateImport(
 	return []*schema.ResourceData{d}, nil
 }
 
+func currentlyInUseBy(awsErr string, conn *elb.ELB) {
+	r := regexp.MustCompile(`currently in use by ([a-z0-9:-]+)\/([a-z0-9-]+)\.`)
+	matches := r.FindStringSubmatch(awsErr)
+	if len(matches) > 0 {
+		lbName := matches[2]
+		describeElbOpts := &elb.DescribeLoadBalancersInput{
+			LoadBalancerNames: []*string{aws.String(lbName)},
+		}
+		if _, err := conn.DescribeLoadBalancers(describeElbOpts); err != nil {
+			if isAWSErr(err, "LoadBalancerNotFound", "") {
+				log.Printf("[WARN] Load Balancer (%s) causing delete conflict not found", lbName)
+			}
+		}
+	}
+}
+
 func normalizeCert(cert interface{}) string {
 	if cert == nil || cert == (*string)(nil) {
 		return ""
 	}
 
 	var rawCert string
-	switch cert.(type) {
+	switch cert := cert.(type) {
 	case string:
-		rawCert = cert.(string)
+		rawCert = cert
 	case *string:
-		rawCert = *cert.(*string)
+		rawCert = *cert
 	default:
 		return ""
 	}
@@ -240,4 +237,10 @@ func stripCR(b []byte) []byte {
 		}
 	}
 	return c[:i]
+}
+
+// Terraform AWS Provider version 3.0.0 removed state hash storage.
+// This DiffSuppressFunc prevents the resource from triggering needless recreation.
+func suppressNormalizeCertRemoval(k, old, new string, d *schema.ResourceData) bool {
+	return normalizeCert(new) == old
 }

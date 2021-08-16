@@ -5,12 +5,13 @@ import (
 	"log"
 	"strconv"
 
-	"github.com/hashicorp/terraform/helper/hashcode"
-	"github.com/hashicorp/terraform/helper/schema"
-
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/service/opsworks"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/structure"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/hashcode"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 // OpsWorks has a single concept of "layer" which represents several different
@@ -45,156 +46,161 @@ var (
 
 func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 	resourceSchema := map[string]*schema.Schema{
-		"id": &schema.Schema{
-			Type:     schema.TypeString,
-			Computed: true,
-		},
-
-		"auto_assign_elastic_ips": &schema.Schema{
+		"auto_assign_elastic_ips": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  false,
 		},
 
-		"auto_assign_public_ips": &schema.Schema{
+		"auto_assign_public_ips": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  false,
 		},
 
-		"custom_instance_profile_arn": &schema.Schema{
+		"custom_instance_profile_arn": {
+			Type:         schema.TypeString,
+			Optional:     true,
+			ValidateFunc: validateArn,
+		},
+
+		"elastic_load_balancer": {
 			Type:     schema.TypeString,
 			Optional: true,
 		},
 
-		"elastic_load_balancer": &schema.Schema{
-			Type:     schema.TypeString,
-			Optional: true,
-		},
-
-		"custom_setup_recipes": &schema.Schema{
+		"custom_setup_recipes": {
 			Type:     schema.TypeList,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 		},
 
-		"custom_configure_recipes": &schema.Schema{
+		"custom_configure_recipes": {
 			Type:     schema.TypeList,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 		},
 
-		"custom_deploy_recipes": &schema.Schema{
+		"custom_deploy_recipes": {
 			Type:     schema.TypeList,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 		},
 
-		"custom_undeploy_recipes": &schema.Schema{
+		"custom_undeploy_recipes": {
 			Type:     schema.TypeList,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 		},
 
-		"custom_shutdown_recipes": &schema.Schema{
+		"custom_shutdown_recipes": {
 			Type:     schema.TypeList,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 		},
 
-		"custom_security_group_ids": &schema.Schema{
+		"custom_security_group_ids": {
 			Type:     schema.TypeSet,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 			Set:      schema.HashString,
 		},
 
-		"custom_json": &schema.Schema{
-			Type:      schema.TypeString,
-			StateFunc: normalizeJson,
-			Optional:  true,
+		"custom_json": {
+			Type: schema.TypeString,
+			StateFunc: func(v interface{}) string {
+				json, _ := structure.NormalizeJsonString(v)
+				return json
+			},
+			Optional: true,
 		},
 
-		"auto_healing": &schema.Schema{
+		"auto_healing": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  true,
 		},
 
-		"install_updates_on_boot": &schema.Schema{
+		"install_updates_on_boot": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  true,
 		},
 
-		"instance_shutdown_timeout": &schema.Schema{
+		"instance_shutdown_timeout": {
 			Type:     schema.TypeInt,
 			Optional: true,
 			Default:  120,
 		},
 
-		"drain_elb_on_shutdown": &schema.Schema{
+		"drain_elb_on_shutdown": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  true,
 		},
 
-		"system_packages": &schema.Schema{
+		"system_packages": {
 			Type:     schema.TypeSet,
 			Optional: true,
 			Elem:     &schema.Schema{Type: schema.TypeString},
 			Set:      schema.HashString,
 		},
 
-		"stack_id": &schema.Schema{
+		"stack_id": {
 			Type:     schema.TypeString,
 			ForceNew: true,
 			Required: true,
 		},
 
-		"use_ebs_optimized_instances": &schema.Schema{
+		"use_ebs_optimized_instances": {
 			Type:     schema.TypeBool,
 			Optional: true,
 			Default:  false,
 		},
 
-		"ebs_volume": &schema.Schema{
+		"ebs_volume": {
 			Type:     schema.TypeSet,
 			Optional: true,
 			Elem: &schema.Resource{
 				Schema: map[string]*schema.Schema{
 
-					"iops": &schema.Schema{
+					"iops": {
 						Type:     schema.TypeInt,
 						Optional: true,
 						Default:  0,
 					},
 
-					"mount_point": &schema.Schema{
+					"mount_point": {
 						Type:     schema.TypeString,
 						Required: true,
 					},
 
-					"number_of_disks": &schema.Schema{
+					"number_of_disks": {
 						Type:     schema.TypeInt,
 						Required: true,
 					},
 
-					"raid_level": &schema.Schema{
+					"raid_level": {
 						Type:     schema.TypeString,
 						Optional: true,
 						Default:  "",
 					},
 
-					"size": &schema.Schema{
+					"size": {
 						Type:     schema.TypeInt,
 						Required: true,
 					},
 
-					"type": &schema.Schema{
+					"type": {
 						Type:     schema.TypeString,
 						Optional: true,
 						Default:  "standard",
+					},
+
+					"encrypted": {
+						Type:     schema.TypeBool,
+						Optional: true,
+						Default:  false,
 					},
 				},
 			},
@@ -203,6 +209,11 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 				return hashcode.String(m["mount_point"].(string))
 			},
 		},
+		"arn": {
+			Type:     schema.TypeString,
+			Computed: true,
+		},
+		"tags": tagsSchema(),
 	}
 
 	if lt.CustomShortName {
@@ -237,15 +248,19 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 	return &schema.Resource{
 		Read: func(d *schema.ResourceData, meta interface{}) error {
 			client := meta.(*AWSClient).opsworksconn
-			return lt.Read(d, client)
+			ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
+
+			return lt.Read(d, client, ignoreTagsConfig)
 		},
 		Create: func(d *schema.ResourceData, meta interface{}) error {
 			client := meta.(*AWSClient).opsworksconn
-			return lt.Create(d, client)
+			return lt.Create(d, client, meta)
 		},
 		Update: func(d *schema.ResourceData, meta interface{}) error {
 			client := meta.(*AWSClient).opsworksconn
-			return lt.Update(d, client)
+			ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
+
+			return lt.Update(d, client, ignoreTagsConfig)
 		},
 		Delete: func(d *schema.ResourceData, meta interface{}) error {
 			client := meta.(*AWSClient).opsworksconn
@@ -259,7 +274,7 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 	}
 }
 
-func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWorks, ignoreTagsConfig *keyvaluetags.IgnoreConfig) error {
 
 	req := &opsworks.DescribeLayersInput{
 		LayerIds: []*string{
@@ -271,17 +286,15 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 
 	resp, err := client.DescribeLayers(req)
 	if err != nil {
-		if awserr, ok := err.(awserr.Error); ok {
-			if awserr.Code() == "ResourceNotFoundException" {
-				d.SetId("")
-				return nil
-			}
+		if isAWSErr(err, opsworks.ErrCodeResourceNotFoundException, "") {
+			d.SetId("")
+			return nil
 		}
 		return err
 	}
 
 	layer := resp.Layers[0]
-	d.Set("id", layer.LayerId)
+	d.SetId(aws.StringValue(layer.LayerId))
 	d.Set("auto_assign_elastic_ips", layer.AutoAssignElasticIps)
 	d.Set("auto_assign_public_ips", layer.AutoAssignPublicIps)
 	d.Set("custom_instance_profile_arn", layer.CustomInstanceProfileArn)
@@ -297,15 +310,20 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 		d.Set("short_name", layer.Shortname)
 	}
 
-	if v := layer.CustomJson; v == nil {
-		if err := d.Set("custom_json", ""); err != nil {
-			return err
+	if layer.CustomJson == nil {
+		d.Set("custom_json", "")
+	} else {
+		policy, err := structure.NormalizeJsonString(*layer.CustomJson)
+		if err != nil {
+			return fmt.Errorf("policy contains an invalid JSON: %s", err)
 		}
-	} else if err := d.Set("custom_json", normalizeJson(*v)); err != nil {
-		return err
+		d.Set("custom_json", policy)
 	}
 
-	lt.SetAttributeMap(d, layer.Attributes)
+	err = lt.SetAttributeMap(d, layer.Attributes)
+	if err != nil {
+		return err
+	}
 	lt.SetLifecycleEventConfiguration(d, layer.LifecycleEventConfiguration)
 	lt.SetCustomRecipes(d, layer.CustomRecipes)
 	lt.SetVolumeConfigurations(d, layer.VolumeConfigurations)
@@ -330,11 +348,28 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 		}
 	}
 
+	arn := aws.StringValue(layer.Arn)
+	d.Set("arn", arn)
+	tags, err := keyvaluetags.OpsworksListTags(client, arn)
+
+	if err != nil {
+		return fmt.Errorf("error listing tags for Opsworks Layer (%s): %s", arn, err)
+	}
+
+	if err := d.Set("tags", tags.IgnoreAws().IgnoreConfig(ignoreTagsConfig).Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
+
 	return nil
 }
 
-func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.OpsWorks, meta interface{}) error {
+	ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
 
+	attributes, err := lt.AttributeMap(d)
+	if err != nil {
+		return err
+	}
 	req := &opsworks.CreateLayerInput{
 		AutoAssignElasticIps:        aws.Bool(d.Get("auto_assign_elastic_ips").(bool)),
 		AutoAssignPublicIps:         aws.Bool(d.Get("auto_assign_public_ips").(bool)),
@@ -344,13 +379,13 @@ func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.Ops
 		EnableAutoHealing:           aws.Bool(d.Get("auto_healing").(bool)),
 		InstallUpdatesOnBoot:        aws.Bool(d.Get("install_updates_on_boot").(bool)),
 		LifecycleEventConfiguration: lt.LifecycleEventConfiguration(d),
-		Name:                     aws.String(d.Get("name").(string)),
-		Packages:                 expandStringSet(d.Get("system_packages").(*schema.Set)),
-		Type:                     aws.String(lt.TypeName),
-		StackId:                  aws.String(d.Get("stack_id").(string)),
-		UseEbsOptimizedInstances: aws.Bool(d.Get("use_ebs_optimized_instances").(bool)),
-		Attributes:               lt.AttributeMap(d),
-		VolumeConfigurations:     lt.VolumeConfigurations(d),
+		Name:                        aws.String(d.Get("name").(string)),
+		Packages:                    expandStringSet(d.Get("system_packages").(*schema.Set)),
+		Type:                        aws.String(lt.TypeName),
+		StackId:                     aws.String(d.Get("stack_id").(string)),
+		UseEbsOptimizedInstances:    aws.Bool(d.Get("use_ebs_optimized_instances").(bool)),
+		Attributes:                  attributes,
+		VolumeConfigurations:        lt.VolumeConfigurations(d),
 	}
 
 	if lt.CustomShortName {
@@ -370,7 +405,6 @@ func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.Ops
 
 	layerId := *resp.LayerId
 	d.SetId(layerId)
-	d.Set("id", layerId)
 
 	loadBalancer := aws.String(d.Get("elastic_load_balancer").(string))
 	if loadBalancer != nil && *loadBalancer != "" {
@@ -384,11 +418,28 @@ func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.Ops
 		}
 	}
 
-	return lt.Read(d, client)
+	arn := arn.ARN{
+		Partition: meta.(*AWSClient).partition,
+		Region:    meta.(*AWSClient).region,
+		Service:   "opsworks",
+		AccountID: meta.(*AWSClient).accountid,
+		Resource:  fmt.Sprintf("layer/%s", d.Id()),
+	}.String()
+
+	if v, ok := d.GetOk("tags"); ok {
+		if err := keyvaluetags.OpsworksUpdateTags(client, arn, nil, v.(map[string]interface{})); err != nil {
+			return fmt.Errorf("error updating Opsworks stack (%s) tags: %s", arn, err)
+		}
+	}
+
+	return lt.Read(d, client, ignoreTagsConfig)
 }
 
-func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.OpsWorks) error {
-
+func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.OpsWorks, ignoreTagsConfig *keyvaluetags.IgnoreConfig) error {
+	attributes, err := lt.AttributeMap(d)
+	if err != nil {
+		return err
+	}
 	req := &opsworks.UpdateLayerInput{
 		LayerId:                     aws.String(d.Id()),
 		AutoAssignElasticIps:        aws.Bool(d.Get("auto_assign_elastic_ips").(bool)),
@@ -399,11 +450,11 @@ func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.Ops
 		EnableAutoHealing:           aws.Bool(d.Get("auto_healing").(bool)),
 		InstallUpdatesOnBoot:        aws.Bool(d.Get("install_updates_on_boot").(bool)),
 		LifecycleEventConfiguration: lt.LifecycleEventConfiguration(d),
-		Name:                     aws.String(d.Get("name").(string)),
-		Packages:                 expandStringSet(d.Get("system_packages").(*schema.Set)),
-		UseEbsOptimizedInstances: aws.Bool(d.Get("use_ebs_optimized_instances").(bool)),
-		Attributes:               lt.AttributeMap(d),
-		VolumeConfigurations:     lt.VolumeConfigurations(d),
+		Name:                        aws.String(d.Get("name").(string)),
+		Packages:                    expandStringSet(d.Get("system_packages").(*schema.Set)),
+		UseEbsOptimizedInstances:    aws.Bool(d.Get("use_ebs_optimized_instances").(bool)),
+		Attributes:                  attributes,
+		VolumeConfigurations:        lt.VolumeConfigurations(d),
 	}
 
 	if lt.CustomShortName {
@@ -445,12 +496,21 @@ func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.Ops
 		}
 	}
 
-	_, err := client.UpdateLayer(req)
+	_, err = client.UpdateLayer(req)
 	if err != nil {
 		return err
 	}
 
-	return lt.Read(d, client)
+	if d.HasChange("tags") {
+		o, n := d.GetChange("tags")
+
+		arn := d.Get("arn").(string)
+		if err := keyvaluetags.OpsworksUpdateTags(client, arn, o, n); err != nil {
+			return fmt.Errorf("error updating Opsworks Layer (%s) tags: %s", arn, err)
+		}
+	}
+
+	return lt.Read(d, client, ignoreTagsConfig)
 }
 
 func (lt *opsworksLayerType) Delete(d *schema.ResourceData, client *opsworks.OpsWorks) error {
@@ -464,7 +524,7 @@ func (lt *opsworksLayerType) Delete(d *schema.ResourceData, client *opsworks.Ops
 	return err
 }
 
-func (lt *opsworksLayerType) AttributeMap(d *schema.ResourceData) map[string]*string {
+func (lt *opsworksLayerType) AttributeMap(d *schema.ResourceData) (map[string]*string, error) {
 	attrs := map[string]*string{}
 
 	for key, def := range lt.Attributes {
@@ -486,14 +546,14 @@ func (lt *opsworksLayerType) AttributeMap(d *schema.ResourceData) map[string]*st
 			}
 		default:
 			// should never happen
-			panic(fmt.Errorf("Unsupported OpsWorks layer attribute type"))
+			return nil, fmt.Errorf("Unsupported OpsWorks layer attribute type: %s", def.Type)
 		}
 	}
 
-	return attrs
+	return attrs, nil
 }
 
-func (lt *opsworksLayerType) SetAttributeMap(d *schema.ResourceData, attrs map[string]*string) {
+func (lt *opsworksLayerType) SetAttributeMap(d *schema.ResourceData, attrs map[string]*string) error {
 	for key, def := range lt.Attributes {
 		// Ignore write-only attributes; we'll just keep what we already have stored.
 		// (The AWS API returns garbage placeholder values for these.)
@@ -523,14 +583,15 @@ func (lt *opsworksLayerType) SetAttributeMap(d *schema.ResourceData, attrs map[s
 				d.Set(key, boolValue)
 			default:
 				// should never happen
-				panic(fmt.Errorf("Unsupported OpsWorks layer attribute type"))
+				return fmt.Errorf("Unsupported OpsWorks layer attribute type: %s", def.Type)
 			}
-			return
+			return nil
 
 		} else {
 			d.Set(key, nil)
 		}
 	}
+	return nil
 }
 
 func (lt *opsworksLayerType) LifecycleEventConfiguration(d *schema.ResourceData) *opsworks.LifecycleEventConfiguration {
@@ -593,7 +654,9 @@ func (lt *opsworksLayerType) VolumeConfigurations(d *schema.ResourceData) []*ops
 			NumberOfDisks: aws.Int64(int64(volumeData["number_of_disks"].(int))),
 			Size:          aws.Int64(int64(volumeData["size"].(int))),
 			VolumeType:    aws.String(volumeData["type"].(string)),
+			Encrypted:     aws.Bool(volumeData["encrypted"].(bool)),
 		}
+
 		iops := int64(volumeData["iops"].(int))
 		if iops != 0 {
 			result[i].Iops = aws.Int64(iops)
@@ -638,6 +701,9 @@ func (lt *opsworksLayerType) SetVolumeConfigurations(d *schema.ResourceData, v [
 		}
 		if config.VolumeType != nil {
 			data["type"] = *config.VolumeType
+		}
+		if config.Encrypted != nil {
+			data["encrypted"] = *config.Encrypted
 		}
 	}
 

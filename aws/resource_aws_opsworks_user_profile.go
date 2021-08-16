@@ -3,11 +3,10 @@ package aws
 import (
 	"log"
 
-	"github.com/hashicorp/terraform/helper/schema"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/opsworks"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 func resourceAwsOpsworksUserProfile() *schema.Resource {
@@ -18,11 +17,6 @@ func resourceAwsOpsworksUserProfile() *schema.Resource {
 		Delete: resourceAwsOpsworksUserProfileDelete,
 
 		Schema: map[string]*schema.Schema{
-			"id": {
-				Type:     schema.TypeString,
-				Computed: true,
-			},
-
 			"user_arn": {
 				Type:     schema.TypeString,
 				Required: true,
@@ -97,7 +91,7 @@ func resourceAwsOpsworksUserProfileCreate(d *schema.ResourceData, meta interface
 		return err
 	}
 
-	d.SetId(*resp.IamUserArn)
+	d.SetId(aws.StringValue(resp.IamUserArn))
 
 	return resourceAwsOpsworksUserProfileUpdate(d, meta)
 }

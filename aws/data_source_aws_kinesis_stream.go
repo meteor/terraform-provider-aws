@@ -1,9 +1,10 @@
 package aws
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/hashicorp/terraform/helper/schema"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 func dataSourceAwsKinesisStream() *schema.Resource {
@@ -11,62 +12,61 @@ func dataSourceAwsKinesisStream() *schema.Resource {
 		Read: dataSourceAwsKinesisStreamRead,
 
 		Schema: map[string]*schema.Schema{
-			"name": &schema.Schema{
+			"name": {
 				Type:     schema.TypeString,
 				Required: true,
 			},
 
-			"arn": &schema.Schema{
+			"arn": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"creation_timestamp": &schema.Schema{
+			"creation_timestamp": {
 				Type:     schema.TypeInt,
 				Computed: true,
 			},
 
-			"status": &schema.Schema{
+			"status": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"retention_period": &schema.Schema{
+			"retention_period": {
 				Type:     schema.TypeInt,
 				Computed: true,
 			},
 
-			"open_shards": &schema.Schema{
+			"open_shards": {
 				Type:     schema.TypeSet,
 				Computed: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
 
-			"closed_shards": &schema.Schema{
+			"closed_shards": {
 				Type:     schema.TypeSet,
 				Computed: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
 
-			"shard_level_metrics": &schema.Schema{
+			"shard_level_metrics": {
 				Type:     schema.TypeSet,
 				Computed: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
 
-			"tags": &schema.Schema{
-				Type:     schema.TypeMap,
-				Computed: true,
-			},
+			"tags": tagsSchemaComputed(),
 		},
 	}
 }
 
 func dataSourceAwsKinesisStreamRead(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).kinesisconn
+	ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
+
 	sn := d.Get("name").(string)
 
 	state, err := readKinesisStreamState(conn, sn)
@@ -83,13 +83,15 @@ func dataSourceAwsKinesisStreamRead(d *schema.ResourceData, meta interface{}) er
 	d.Set("retention_period", state.retentionPeriod)
 	d.Set("shard_level_metrics", state.shardLevelMetrics)
 
-	tags, err := conn.ListTagsForStream(&kinesis.ListTagsForStreamInput{
-		StreamName: aws.String(sn),
-	})
+	tags, err := keyvaluetags.KinesisListTags(conn, sn)
+
 	if err != nil {
-		return err
+		return fmt.Errorf("error listing tags for Kinesis Stream (%s): %s", sn, err)
 	}
-	d.Set("tags", tagsToMapKinesis(tags.Tags))
+
+	if err := d.Set("tags", tags.IgnoreAws().IgnoreConfig(ignoreTagsConfig).Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
 
 	return nil
 }

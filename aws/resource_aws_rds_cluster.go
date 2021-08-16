@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -8,10 +9,18 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/aws-sdk-go-base/tfawserr"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
+)
+
+const (
+	rdsClusterScalingConfiguration_DefaultMinCapacity = 1
+	rdsClusterScalingConfiguration_DefaultMaxCapacity = 16
+	rdsClusterTimeoutDelete                           = 2 * time.Minute
 )
 
 func resourceAwsRDSCluster() *schema.Resource {
@@ -31,6 +40,15 @@ func resourceAwsRDSCluster() *schema.Resource {
 		},
 
 		Schema: map[string]*schema.Schema{
+			"arn": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"allow_major_version_upgrade": {
+				Type:     schema.TypeBool,
+				Optional: true,
+			},
 
 			"availability_zones": {
 				Type:     schema.TypeSet,
@@ -39,6 +57,12 @@ func resourceAwsRDSCluster() *schema.Resource {
 				ForceNew: true,
 				Computed: true,
 				Set:      schema.HashString,
+			},
+
+			"backtrack_window": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				ValidateFunc: validation.IntBetween(0, 259200),
 			},
 
 			"cluster_identifier": {
@@ -50,11 +74,12 @@ func resourceAwsRDSCluster() *schema.Resource {
 				ValidateFunc:  validateRdsIdentifier,
 			},
 			"cluster_identifier_prefix": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				Computed:     true,
-				ForceNew:     true,
-				ValidateFunc: validateRdsIdentifierPrefix,
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{"cluster_identifier"},
+				ValidateFunc:  validateRdsIdentifierPrefix,
 			},
 
 			"cluster_members": {
@@ -63,6 +88,12 @@ func resourceAwsRDSCluster() *schema.Resource {
 				Optional: true,
 				Computed: true,
 				Set:      schema.HashString,
+			},
+
+			"copy_tags_to_snapshot": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
 			},
 
 			"database_name": {
@@ -85,9 +116,19 @@ func resourceAwsRDSCluster() *schema.Resource {
 				Computed: true,
 			},
 
+			"deletion_protection": {
+				Type:     schema.TypeBool,
+				Optional: true,
+			},
+
 			"endpoint": {
 				Type:     schema.TypeString,
 				Computed: true,
+			},
+
+			"global_cluster_identifier": {
+				Type:     schema.TypeString,
+				Optional: true,
 			},
 
 			"reader_endpoint": {
@@ -95,17 +136,173 @@ func resourceAwsRDSCluster() *schema.Resource {
 				Computed: true,
 			},
 
+			"hosted_zone_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
 			"engine": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Default:      "aurora",
+				ForceNew:     true,
+				ValidateFunc: validateRdsEngine(),
+			},
+
+			"engine_mode": {
 				Type:     schema.TypeString,
 				Optional: true,
-				Default:  "aurora",
+				ForceNew: true,
+				Default:  "provisioned",
+				ValidateFunc: validation.StringInSlice([]string{
+					"global",
+					"multimaster",
+					"parallelquery",
+					"provisioned",
+					"serverless",
+				}, false),
+			},
+
+			"engine_version": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+
+			"scaling_configuration": {
+				Type:             schema.TypeList,
+				Optional:         true,
+				MaxItems:         1,
+				DiffSuppressFunc: suppressMissingOptionalConfigurationBlock,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"auto_pause": {
+							Type:     schema.TypeBool,
+							Optional: true,
+							Default:  true,
+						},
+						"max_capacity": {
+							Type:     schema.TypeInt,
+							Optional: true,
+							Default:  rdsClusterScalingConfiguration_DefaultMaxCapacity,
+						},
+						"min_capacity": {
+							Type:     schema.TypeInt,
+							Optional: true,
+							Default:  rdsClusterScalingConfiguration_DefaultMinCapacity,
+						},
+						"seconds_until_auto_pause": {
+							Type:         schema.TypeInt,
+							Optional:     true,
+							Default:      300,
+							ValidateFunc: validation.IntBetween(300, 86400),
+						},
+						"timeout_action": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Default:  "RollbackCapacityChange",
+							ValidateFunc: validation.StringInSlice([]string{
+								"ForceApplyCapacityChange",
+								"RollbackCapacityChange",
+							}, false),
+						},
+					},
+				},
 			},
 
 			"storage_encrypted": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				Default:  false,
+				Computed: true,
 				ForceNew: true,
+			},
+
+			"restore_to_point_in_time": {
+				Type:     schema.TypeList,
+				Optional: true,
+				ForceNew: true,
+				MaxItems: 1,
+				ConflictsWith: []string{
+					"s3_import",
+					"snapshot_identifier",
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"source_cluster_identifier": {
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+							ValidateFunc: validation.Any(
+								validateArn,
+								validateRdsIdentifier,
+							),
+						},
+
+						"restore_type": {
+							Type:     schema.TypeString,
+							Optional: true,
+							ForceNew: true,
+							ValidateFunc: validation.StringInSlice([]string{
+								"full-copy",
+								"copy-on-write",
+							}, false),
+						},
+
+						"use_latest_restorable_time": {
+							Type:          schema.TypeBool,
+							Optional:      true,
+							ForceNew:      true,
+							ConflictsWith: []string{"restore_to_point_in_time.0.restore_to_time"},
+						},
+
+						"restore_to_time": {
+							Type:          schema.TypeString,
+							Optional:      true,
+							ForceNew:      true,
+							ValidateFunc:  validateUTCTimestamp,
+							ConflictsWith: []string{"restore_to_point_in_time.0.use_latest_restorable_time"},
+						},
+					},
+				},
+			},
+
+			"s3_import": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				ConflictsWith: []string{
+					"snapshot_identifier",
+					"restore_to_point_in_time",
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"bucket_name": {
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+						},
+						"bucket_prefix": {
+							Type:     schema.TypeString,
+							Optional: true,
+							ForceNew: true,
+						},
+						"ingestion_role": {
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+						},
+						"source_engine": {
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+						},
+						"source_engine_version": {
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+						},
+					},
+				},
 			},
 
 			"final_snapshot_identifier": {
@@ -148,15 +345,14 @@ func resourceAwsRDSCluster() *schema.Resource {
 
 			"snapshot_identifier": {
 				Type:     schema.TypeString,
-				Computed: false,
 				Optional: true,
-				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
 
 			"port": {
 				Type:     schema.TypeInt,
 				Optional: true,
 				Computed: true,
+				ForceNew: true,
 			},
 
 			// apply_immediately is used to determine when the update modifications
@@ -197,17 +393,10 @@ func resourceAwsRDSCluster() *schema.Resource {
 			},
 
 			"backup_retention_period": {
-				Type:     schema.TypeInt,
-				Optional: true,
-				Default:  1,
-				ValidateFunc: func(v interface{}, k string) (ws []string, es []error) {
-					value := v.(int)
-					if value > 35 {
-						es = append(es, fmt.Errorf(
-							"backup retention period cannot be more than 35 days"))
-					}
-					return
-				},
+				Type:         schema.TypeInt,
+				Optional:     true,
+				Default:      1,
+				ValidateFunc: validation.IntAtMost(35),
 			},
 
 			"kms_key_id": {
@@ -240,6 +429,32 @@ func resourceAwsRDSCluster() *schema.Resource {
 				Computed: true,
 			},
 
+			"source_region": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+			},
+
+			"enabled_cloudwatch_logs_exports": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+					ValidateFunc: validation.StringInSlice([]string{
+						"audit",
+						"error",
+						"general",
+						"slowquery",
+						"postgresql",
+					}, false),
+				},
+			},
+			"enable_http_endpoint": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
+
 			"tags": tagsSchema(),
 		},
 	}
@@ -256,39 +471,79 @@ func resourceAwsRdsClusterImport(
 
 func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).rdsconn
-	tags := tagsFromMapRDS(d.Get("tags").(map[string]interface{}))
+	tags := keyvaluetags.New(d.Get("tags").(map[string]interface{})).IgnoreAws().RdsTags()
+
+	// Some API calls (e.g. RestoreDBClusterFromSnapshot do not support all
+	// parameters to correctly apply all settings in one pass. For missing
+	// parameters or unsupported configurations, we may need to call
+	// ModifyDBInstance afterwards to prevent Terraform operators from API
+	// errors or needing to double apply.
+	var requiresModifyDbCluster bool
+	modifyDbClusterInput := &rds.ModifyDBClusterInput{
+		ApplyImmediately: aws.Bool(true),
+	}
 
 	var identifier string
 	if v, ok := d.GetOk("cluster_identifier"); ok {
 		identifier = v.(string)
+	} else if v, ok := d.GetOk("cluster_identifier_prefix"); ok {
+		identifier = resource.PrefixedUniqueId(v.(string))
 	} else {
-		if v, ok := d.GetOk("cluster_identifier_prefix"); ok {
-			identifier = resource.PrefixedUniqueId(v.(string))
-		} else {
-			identifier = resource.PrefixedUniqueId("tf-")
-		}
-
-		d.Set("cluster_identifier", identifier)
+		identifier = resource.PrefixedUniqueId("tf-")
 	}
 
 	if _, ok := d.GetOk("snapshot_identifier"); ok {
 		opts := rds.RestoreDBClusterFromSnapshotInput{
-			DBClusterIdentifier: aws.String(d.Get("cluster_identifier").(string)),
-			SnapshotIdentifier:  aws.String(d.Get("snapshot_identifier").(string)),
-			Engine:              aws.String(d.Get("engine").(string)),
-			Tags:                tags,
+			CopyTagsToSnapshot:   aws.Bool(d.Get("copy_tags_to_snapshot").(bool)),
+			DBClusterIdentifier:  aws.String(identifier),
+			DeletionProtection:   aws.Bool(d.Get("deletion_protection").(bool)),
+			Engine:               aws.String(d.Get("engine").(string)),
+			EngineMode:           aws.String(d.Get("engine_mode").(string)),
+			ScalingConfiguration: expandRdsClusterScalingConfiguration(d.Get("scaling_configuration").([]interface{})),
+			SnapshotIdentifier:   aws.String(d.Get("snapshot_identifier").(string)),
+			Tags:                 tags,
 		}
 
 		if attr := d.Get("availability_zones").(*schema.Set); attr.Len() > 0 {
-			opts.AvailabilityZones = expandStringList(attr.List())
+			opts.AvailabilityZones = expandStringSet(attr)
+		}
+
+		if v, ok := d.GetOk("backtrack_window"); ok {
+			opts.BacktrackWindow = aws.Int64(int64(v.(int)))
+		}
+
+		if attr, ok := d.GetOk("backup_retention_period"); ok {
+			modifyDbClusterInput.BackupRetentionPeriod = aws.Int64(int64(attr.(int)))
+			requiresModifyDbCluster = true
+		}
+
+		if attr, ok := d.GetOk("database_name"); ok {
+			opts.DatabaseName = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("db_cluster_parameter_group_name"); ok {
+			opts.DBClusterParameterGroupName = aws.String(attr.(string))
 		}
 
 		if attr, ok := d.GetOk("db_subnet_group_name"); ok {
 			opts.DBSubnetGroupName = aws.String(attr.(string))
 		}
 
-		if attr, ok := d.GetOk("database_name"); ok {
-			opts.DatabaseName = aws.String(attr.(string))
+		if attr, ok := d.GetOk("enabled_cloudwatch_logs_exports"); ok && attr.(*schema.Set).Len() > 0 {
+			opts.EnableCloudwatchLogsExports = expandStringSet(attr.(*schema.Set))
+		}
+
+		if attr, ok := d.GetOk("engine_version"); ok {
+			opts.EngineVersion = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("kms_key_id"); ok {
+			opts.KmsKeyId = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("master_password"); ok {
+			modifyDbClusterInput.MasterUserPassword = aws.String(attr.(string))
+			requiresModifyDbCluster = true
 		}
 
 		if attr, ok := d.GetOk("option_group_name"); ok {
@@ -299,127 +554,62 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 			opts.Port = aws.Int64(int64(attr.(int)))
 		}
 
-		// Check if any of the parameters that require a cluster modification after creation are set
-		var clusterUpdate bool
+		if attr, ok := d.GetOk("preferred_backup_window"); ok {
+			modifyDbClusterInput.PreferredBackupWindow = aws.String(attr.(string))
+			requiresModifyDbCluster = true
+		}
+
+		if attr, ok := d.GetOk("preferred_maintenance_window"); ok {
+			modifyDbClusterInput.PreferredMaintenanceWindow = aws.String(attr.(string))
+			requiresModifyDbCluster = true
+		}
+
 		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
-			clusterUpdate = true
-			opts.VpcSecurityGroupIds = expandStringList(attr.List())
-		}
-
-		if _, ok := d.GetOk("db_cluster_parameter_group_name"); ok {
-			clusterUpdate = true
-		}
-
-		if _, ok := d.GetOk("backup_retention_period"); ok {
-			clusterUpdate = true
+			opts.VpcSecurityGroupIds = expandStringSet(attr)
 		}
 
 		log.Printf("[DEBUG] RDS Cluster restore from snapshot configuration: %s", opts)
-		_, err := conn.RestoreDBClusterFromSnapshot(&opts)
+		err := resource.Retry(1*time.Minute, func() *resource.RetryError {
+			_, err := conn.RestoreDBClusterFromSnapshot(&opts)
+			if err != nil {
+				if isAWSErr(err, "InvalidParameterValue", "IAM role ARN value is invalid or does not include the required permissions") {
+					return resource.RetryableError(err)
+				}
+				return resource.NonRetryableError(err)
+			}
+			return nil
+		})
+		if isResourceTimeoutError(err) {
+			_, err = conn.RestoreDBClusterFromSnapshot(&opts)
+		}
 		if err != nil {
 			return fmt.Errorf("Error creating RDS Cluster: %s", err)
 		}
-
-		if clusterUpdate {
-			log.Printf("[INFO] RDS Cluster is restoring from snapshot with default db_cluster_parameter_group_name, backup_retention_period and vpc_security_group_ids" +
-				"but custom values should be set, will now update after snapshot is restored!")
-
-			d.SetId(d.Get("cluster_identifier").(string))
-
-			log.Printf("[INFO] RDS Cluster ID: %s", d.Id())
-
-			log.Println("[INFO] Waiting for RDS Cluster to be available")
-
-			stateConf := &resource.StateChangeConf{
-				Pending:    []string{"creating", "backing-up", "modifying", "preparing-data-migration", "migrating"},
-				Target:     []string{"available"},
-				Refresh:    resourceAwsRDSClusterStateRefreshFunc(d, meta),
-				Timeout:    d.Timeout(schema.TimeoutCreate),
-				MinTimeout: 10 * time.Second,
-				Delay:      30 * time.Second,
-			}
-
-			// Wait, catching any errors
-			_, err := stateConf.WaitForState()
-			if err != nil {
-				return err
-			}
-
-			err = resourceAwsRDSClusterUpdate(d, meta)
-			if err != nil {
-				return err
-			}
-		}
-	} else if _, ok := d.GetOk("replication_source_identifier"); ok {
-		createOpts := &rds.CreateDBClusterInput{
-			DBClusterIdentifier:         aws.String(d.Get("cluster_identifier").(string)),
-			Engine:                      aws.String(d.Get("engine").(string)),
-			StorageEncrypted:            aws.Bool(d.Get("storage_encrypted").(bool)),
-			ReplicationSourceIdentifier: aws.String(d.Get("replication_source_identifier").(string)),
-			Tags: tags,
-		}
-
-		if attr, ok := d.GetOk("port"); ok {
-			createOpts.Port = aws.Int64(int64(attr.(int)))
-		}
-
-		if attr, ok := d.GetOk("db_subnet_group_name"); ok {
-			createOpts.DBSubnetGroupName = aws.String(attr.(string))
-		}
-
-		if attr, ok := d.GetOk("db_cluster_parameter_group_name"); ok {
-			createOpts.DBClusterParameterGroupName = aws.String(attr.(string))
-		}
-
-		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
-			createOpts.VpcSecurityGroupIds = expandStringList(attr.List())
-		}
-
-		if attr := d.Get("availability_zones").(*schema.Set); attr.Len() > 0 {
-			createOpts.AvailabilityZones = expandStringList(attr.List())
-		}
-
-		if v, ok := d.GetOk("backup_retention_period"); ok {
-			createOpts.BackupRetentionPeriod = aws.Int64(int64(v.(int)))
-		}
-
-		if v, ok := d.GetOk("preferred_backup_window"); ok {
-			createOpts.PreferredBackupWindow = aws.String(v.(string))
-		}
-
-		if v, ok := d.GetOk("preferred_maintenance_window"); ok {
-			createOpts.PreferredMaintenanceWindow = aws.String(v.(string))
-		}
-
-		if attr, ok := d.GetOk("kms_key_id"); ok {
-			createOpts.KmsKeyId = aws.String(attr.(string))
-		}
-
-		log.Printf("[DEBUG] Create RDS Cluster as read replica: %s", createOpts)
-		resp, err := conn.CreateDBCluster(createOpts)
-		if err != nil {
-			log.Printf("[ERROR] Error creating RDS Cluster: %s", err)
-			return err
-		}
-
-		log.Printf("[DEBUG]: RDS Cluster create response: %s", resp)
-
-	} else {
+	} else if v, ok := d.GetOk("s3_import"); ok {
 		if _, ok := d.GetOk("master_password"); !ok {
-			return fmt.Errorf(`provider.aws: aws_rds_cluster: %s: "master_password": required field is not set`, d.Get("database_name").(string))
+			return fmt.Errorf(`provider.aws: aws_db_instance: %s: "master_password": required field is not set`, d.Get("name").(string))
 		}
-
 		if _, ok := d.GetOk("master_username"); !ok {
-			return fmt.Errorf(`provider.aws: aws_rds_cluster: %s: "master_username": required field is not set`, d.Get("database_name").(string))
+			return fmt.Errorf(`provider.aws: aws_db_instance: %s: "master_username": required field is not set`, d.Get("name").(string))
+		}
+		s3_bucket := v.([]interface{})[0].(map[string]interface{})
+		createOpts := &rds.RestoreDBClusterFromS3Input{
+			CopyTagsToSnapshot:  aws.Bool(d.Get("copy_tags_to_snapshot").(bool)),
+			DBClusterIdentifier: aws.String(identifier),
+			DeletionProtection:  aws.Bool(d.Get("deletion_protection").(bool)),
+			Engine:              aws.String(d.Get("engine").(string)),
+			MasterUsername:      aws.String(d.Get("master_username").(string)),
+			MasterUserPassword:  aws.String(d.Get("master_password").(string)),
+			S3BucketName:        aws.String(s3_bucket["bucket_name"].(string)),
+			S3IngestionRoleArn:  aws.String(s3_bucket["ingestion_role"].(string)),
+			S3Prefix:            aws.String(s3_bucket["bucket_prefix"].(string)),
+			SourceEngine:        aws.String(s3_bucket["source_engine"].(string)),
+			SourceEngineVersion: aws.String(s3_bucket["source_engine_version"].(string)),
+			Tags:                tags,
 		}
 
-		createOpts := &rds.CreateDBClusterInput{
-			DBClusterIdentifier: aws.String(d.Get("cluster_identifier").(string)),
-			Engine:              aws.String(d.Get("engine").(string)),
-			MasterUserPassword:  aws.String(d.Get("master_password").(string)),
-			MasterUsername:      aws.String(d.Get("master_username").(string)),
-			StorageEncrypted:    aws.Bool(d.Get("storage_encrypted").(bool)),
-			Tags:                tags,
+		if v, ok := d.GetOk("backtrack_window"); ok {
+			createOpts.BacktrackWindow = aws.Int64(int64(v.(int)))
 		}
 
 		if v := d.Get("database_name"); v.(string) != "" {
@@ -438,12 +628,16 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 			createOpts.DBClusterParameterGroupName = aws.String(attr.(string))
 		}
 
+		if attr, ok := d.GetOk("engine_version"); ok {
+			createOpts.EngineVersion = aws.String(attr.(string))
+		}
+
 		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
-			createOpts.VpcSecurityGroupIds = expandStringList(attr.List())
+			createOpts.VpcSecurityGroupIds = expandStringSet(attr)
 		}
 
 		if attr := d.Get("availability_zones").(*schema.Set); attr.Len() > 0 {
-			createOpts.AvailabilityZones = expandStringList(attr.List())
+			createOpts.AvailabilityZones = expandStringSet(attr)
 		}
 
 		if v, ok := d.GetOk("backup_retention_period"); ok {
@@ -466,17 +660,267 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 			createOpts.EnableIAMDatabaseAuthentication = aws.Bool(attr.(bool))
 		}
 
-		log.Printf("[DEBUG] RDS Cluster create options: %s", createOpts)
-		resp, err := conn.CreateDBCluster(createOpts)
+		if attr, ok := d.GetOk("enabled_cloudwatch_logs_exports"); ok && attr.(*schema.Set).Len() > 0 {
+			createOpts.EnableCloudwatchLogsExports = expandStringSet(attr.(*schema.Set))
+		}
+
+		if attr, ok := d.GetOkExists("storage_encrypted"); ok {
+			createOpts.StorageEncrypted = aws.Bool(attr.(bool))
+		}
+
+		log.Printf("[DEBUG] RDS Cluster restore options: %s", createOpts)
+		// Retry for IAM/S3 eventual consistency
+		var resp *rds.RestoreDBClusterFromS3Output
+		err := resource.Retry(5*time.Minute, func() *resource.RetryError {
+			var err error
+			resp, err = conn.RestoreDBClusterFromS3(createOpts)
+			if err != nil {
+				// InvalidParameterValue: Files from the specified Amazon S3 bucket cannot be downloaded.
+				// Make sure that you have created an AWS Identity and Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you.
+				if isAWSErr(err, "InvalidParameterValue", "Files from the specified Amazon S3 bucket cannot be downloaded") {
+					return resource.RetryableError(err)
+				}
+				if isAWSErr(err, "InvalidParameterValue", "S3_SNAPSHOT_INGESTION") {
+					return resource.RetryableError(err)
+				}
+				if isAWSErr(err, "InvalidParameterValue", "S3 bucket cannot be found") {
+					return resource.RetryableError(err)
+				}
+				return resource.NonRetryableError(err)
+			}
+			log.Printf("[DEBUG]: RDS Cluster create response: %s", resp)
+			return nil
+		})
+		if isResourceTimeoutError(err) {
+			resp, err = conn.RestoreDBClusterFromS3(createOpts)
+		}
+
 		if err != nil {
 			log.Printf("[ERROR] Error creating RDS Cluster: %s", err)
 			return err
 		}
 
+	} else if v, ok := d.GetOk("restore_to_point_in_time"); ok {
+		pointInTime := v.([]interface{})[0].(map[string]interface{})
+		createOpts := &rds.RestoreDBClusterToPointInTimeInput{
+			DBClusterIdentifier:       aws.String(identifier),
+			DeletionProtection:        aws.Bool(d.Get("deletion_protection").(bool)),
+			SourceDBClusterIdentifier: aws.String(pointInTime["source_cluster_identifier"].(string)),
+			Tags:                      tags,
+		}
+
+		if v, ok := pointInTime["restore_to_time"].(string); ok && v != "" {
+			restoreToTime, _ := time.Parse(time.RFC3339, v)
+			createOpts.RestoreToTime = aws.Time(restoreToTime)
+		}
+
+		if v, ok := pointInTime["use_latest_restorable_time"].(bool); ok && v {
+			createOpts.UseLatestRestorableTime = aws.Bool(v)
+		}
+
+		if createOpts.RestoreToTime == nil && createOpts.UseLatestRestorableTime == nil {
+			return fmt.Errorf(`provider.aws: aws_rds_cluster: %s: Either "restore_to_time" or "use_latest_restorable_time" must be set`, d.Get("database_name").(string))
+		}
+
+		if attr, ok := pointInTime["restore_type"].(string); ok {
+			createOpts.RestoreType = aws.String(attr)
+		}
+
+		if v, ok := d.GetOk("backtrack_window"); ok {
+			createOpts.BacktrackWindow = aws.Int64(int64(v.(int)))
+		}
+
+		if attr, ok := d.GetOk("db_subnet_group_name"); ok {
+			createOpts.DBSubnetGroupName = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("port"); ok {
+			createOpts.Port = aws.Int64(int64(attr.(int)))
+		}
+
+		if attr, ok := d.GetOk("option_group_name"); ok {
+			createOpts.OptionGroupName = aws.String(attr.(string))
+		}
+
+		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
+			createOpts.VpcSecurityGroupIds = expandStringSet(attr)
+		}
+
+		if attr, ok := d.GetOk("kms_key_id"); ok {
+			createOpts.KmsKeyId = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("enabled_cloudwatch_logs_exports"); ok && attr.(*schema.Set).Len() > 0 {
+			createOpts.EnableCloudwatchLogsExports = expandStringSet(attr.(*schema.Set))
+		}
+
+		if attr, ok := d.GetOk("iam_database_authentication_enabled"); ok {
+			createOpts.EnableIAMDatabaseAuthentication = aws.Bool(attr.(bool))
+		}
+
+		if attr, ok := d.GetOk("db_cluster_parameter_group_name"); ok {
+			createOpts.DBClusterParameterGroupName = aws.String(attr.(string))
+		}
+
+		requireUpdateAttrs := []string{
+			"master_password",
+			"backup_retention_period",
+			"preferred_backup_window",
+			"preferred_maintenance_window",
+			"scaling_configuration",
+		}
+
+		for _, attr := range requireUpdateAttrs {
+			if val, ok := d.GetOk(attr); ok {
+				requiresModifyDbCluster = true
+				switch attr {
+				case "master_password":
+					modifyDbClusterInput.MasterUserPassword = aws.String(val.(string))
+				case "backup_retention_period":
+					modifyDbClusterInput.BackupRetentionPeriod = aws.Int64(int64(val.(int)))
+				case "preferred_backup_window":
+					modifyDbClusterInput.PreferredBackupWindow = aws.String(val.(string))
+				case "preferred_maintenance_window":
+					modifyDbClusterInput.PreferredMaintenanceWindow = aws.String(val.(string))
+				case "scaling_configuration":
+					modifyDbClusterInput.ScalingConfiguration = expandRdsClusterScalingConfiguration(d.Get("scaling_configuration").([]interface{}))
+				}
+			}
+		}
+
+		log.Printf("[DEBUG] RDS Cluster restore options: %s", createOpts)
+
+		resp, err := conn.RestoreDBClusterToPointInTime(createOpts)
+		if err != nil {
+			log.Printf("[ERROR] Error restoring RDS Cluster: %s", err)
+			return err
+		}
+
+		log.Printf("[DEBUG]: RDS Cluster restore response: %s", resp)
+	} else {
+
+		createOpts := &rds.CreateDBClusterInput{
+			CopyTagsToSnapshot:   aws.Bool(d.Get("copy_tags_to_snapshot").(bool)),
+			DBClusterIdentifier:  aws.String(identifier),
+			DeletionProtection:   aws.Bool(d.Get("deletion_protection").(bool)),
+			Engine:               aws.String(d.Get("engine").(string)),
+			EngineMode:           aws.String(d.Get("engine_mode").(string)),
+			ScalingConfiguration: expandRdsClusterScalingConfiguration(d.Get("scaling_configuration").([]interface{})),
+			Tags:                 tags,
+		}
+
+		// Note: Username and password credentials are required and valid
+		// unless the cluster is a read-replica. This also applies to clusters
+		// within a global cluster. Providing a password and/or username for
+		// a replica will result in an InvalidParameterValue error.
+		if v, ok := d.GetOk("master_password"); ok {
+			createOpts.MasterUserPassword = aws.String(v.(string))
+		}
+
+		if v, ok := d.GetOk("master_username"); ok {
+			createOpts.MasterUsername = aws.String(v.(string))
+		}
+
+		if v, ok := d.GetOk("enable_http_endpoint"); ok {
+			createOpts.EnableHttpEndpoint = aws.Bool(v.(bool))
+		}
+
+		if v, ok := d.GetOk("backtrack_window"); ok {
+			createOpts.BacktrackWindow = aws.Int64(int64(v.(int)))
+		}
+
+		if v := d.Get("database_name"); v.(string) != "" {
+			createOpts.DatabaseName = aws.String(v.(string))
+		}
+
+		if attr, ok := d.GetOk("port"); ok {
+			createOpts.Port = aws.Int64(int64(attr.(int)))
+		}
+
+		if attr, ok := d.GetOk("db_subnet_group_name"); ok {
+			createOpts.DBSubnetGroupName = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("db_cluster_parameter_group_name"); ok {
+			createOpts.DBClusterParameterGroupName = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("engine_version"); ok {
+			createOpts.EngineVersion = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("global_cluster_identifier"); ok {
+			createOpts.GlobalClusterIdentifier = aws.String(attr.(string))
+		}
+
+		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
+			createOpts.VpcSecurityGroupIds = expandStringSet(attr)
+		}
+
+		if attr := d.Get("availability_zones").(*schema.Set); attr.Len() > 0 {
+			createOpts.AvailabilityZones = expandStringSet(attr)
+		}
+
+		if v, ok := d.GetOk("backup_retention_period"); ok {
+			createOpts.BackupRetentionPeriod = aws.Int64(int64(v.(int)))
+		}
+
+		if v, ok := d.GetOk("preferred_backup_window"); ok {
+			createOpts.PreferredBackupWindow = aws.String(v.(string))
+		}
+
+		if v, ok := d.GetOk("preferred_maintenance_window"); ok {
+			createOpts.PreferredMaintenanceWindow = aws.String(v.(string))
+		}
+
+		if attr, ok := d.GetOk("kms_key_id"); ok {
+			createOpts.KmsKeyId = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("source_region"); ok {
+			createOpts.SourceRegion = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOk("iam_database_authentication_enabled"); ok {
+			createOpts.EnableIAMDatabaseAuthentication = aws.Bool(attr.(bool))
+		}
+
+		if attr, ok := d.GetOk("enabled_cloudwatch_logs_exports"); ok && attr.(*schema.Set).Len() > 0 {
+			createOpts.EnableCloudwatchLogsExports = expandStringSet(attr.(*schema.Set))
+		}
+
+		if attr, ok := d.GetOk("replication_source_identifier"); ok && createOpts.GlobalClusterIdentifier == nil {
+			createOpts.ReplicationSourceIdentifier = aws.String(attr.(string))
+		}
+
+		if attr, ok := d.GetOkExists("storage_encrypted"); ok {
+			createOpts.StorageEncrypted = aws.Bool(attr.(bool))
+		}
+
+		log.Printf("[DEBUG] RDS Cluster create options: %s", createOpts)
+		var resp *rds.CreateDBClusterOutput
+		err := resource.Retry(1*time.Minute, func() *resource.RetryError {
+			var err error
+			resp, err = conn.CreateDBCluster(createOpts)
+			if err != nil {
+				if isAWSErr(err, "InvalidParameterValue", "IAM role ARN value is invalid or does not include the required permissions") {
+					return resource.RetryableError(err)
+				}
+				return resource.NonRetryableError(err)
+			}
+			return nil
+		})
+		if isResourceTimeoutError(err) {
+			resp, err = conn.CreateDBCluster(createOpts)
+		}
+		if err != nil {
+			return fmt.Errorf("error creating RDS cluster: %s", err)
+		}
+
 		log.Printf("[DEBUG]: RDS Cluster create response: %s", resp)
 	}
 
-	d.SetId(d.Get("cluster_identifier").(string))
+	d.SetId(identifier)
 
 	log.Printf("[INFO] RDS Cluster ID: %s", d.Id())
 
@@ -484,9 +928,9 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 		"[INFO] Waiting for RDS Cluster to be available")
 
 	stateConf := &resource.StateChangeConf{
-		Pending:    []string{"creating", "backing-up", "modifying"},
+		Pending:    resourceAwsRdsClusterCreatePendingStates,
 		Target:     []string{"available"},
-		Refresh:    resourceAwsRDSClusterStateRefreshFunc(d, meta),
+		Refresh:    resourceAwsRDSClusterStateRefreshFunc(conn, d.Id()),
 		Timeout:    d.Timeout(schema.TimeoutCreate),
 		MinTimeout: 10 * time.Second,
 		Delay:      30 * time.Second,
@@ -495,7 +939,7 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 	// Wait, catching any errors
 	_, err := stateConf.WaitForState()
 	if err != nil {
-		return fmt.Errorf("[WARN] Error waiting for RDS Cluster state to be \"available\": %s", err)
+		return fmt.Errorf("Error waiting for RDS Cluster state to be \"available\": %s", err)
 	}
 
 	if v, ok := d.GetOk("iam_roles"); ok {
@@ -507,44 +951,83 @@ func resourceAwsRDSClusterCreate(d *schema.ResourceData, meta interface{}) error
 		}
 	}
 
+	if requiresModifyDbCluster {
+		modifyDbClusterInput.DBClusterIdentifier = aws.String(d.Id())
+
+		log.Printf("[INFO] RDS Cluster (%s) configuration requires ModifyDBCluster: %s", d.Id(), modifyDbClusterInput)
+		_, err := conn.ModifyDBCluster(modifyDbClusterInput)
+		if err != nil {
+			return fmt.Errorf("error modifying RDS Cluster (%s): %s", d.Id(), err)
+		}
+
+		log.Printf("[INFO] Waiting for RDS Cluster (%s) to be available", d.Id())
+		err = waitForRDSClusterUpdate(conn, d.Id(), d.Timeout(schema.TimeoutCreate))
+		if err != nil {
+			return fmt.Errorf("error waiting for RDS Cluster (%s) to be available: %s", d.Id(), err)
+		}
+	}
+
 	return resourceAwsRDSClusterRead(d, meta)
 }
 
 func resourceAwsRDSClusterRead(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).rdsconn
+	ignoreTagsConfig := meta.(*AWSClient).IgnoreTagsConfig
 
-	resp, err := conn.DescribeDBClusters(&rds.DescribeDBClustersInput{
+	input := &rds.DescribeDBClustersInput{
 		DBClusterIdentifier: aws.String(d.Id()),
-	})
+	}
+
+	log.Printf("[DEBUG] Describing RDS Cluster: %s", input)
+	resp, err := conn.DescribeDBClusters(input)
+
+	if isAWSErr(err, rds.ErrCodeDBClusterNotFoundFault, "") {
+		log.Printf("[WARN] RDS Cluster (%s) not found, removing from state", d.Id())
+		d.SetId("")
+		return nil
+	}
 
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if "DBClusterNotFoundFault" == awsErr.Code() {
-				d.SetId("")
-				log.Printf("[DEBUG] RDS Cluster (%s) not found", d.Id())
-				return nil
-			}
-		}
-		log.Printf("[DEBUG] Error describing RDS Cluster (%s)", d.Id())
-		return err
+		return fmt.Errorf("error describing RDS Cluster (%s): %s", d.Id(), err)
+	}
+
+	if resp == nil {
+		return fmt.Errorf("Error retrieving RDS cluster: empty response for: %s", input)
 	}
 
 	var dbc *rds.DBCluster
 	for _, c := range resp.DBClusters {
-		if *c.DBClusterIdentifier == d.Id() {
+		if aws.StringValue(c.DBClusterIdentifier) == d.Id() {
 			dbc = c
+			break
 		}
 	}
 
 	if dbc == nil {
-		log.Printf("[WARN] RDS Cluster (%s) not found", d.Id())
+		log.Printf("[WARN] RDS Cluster (%s) not found, removing from state", d.Id())
 		d.SetId("")
 		return nil
 	}
 
 	if err := d.Set("availability_zones", aws.StringValueSlice(dbc.AvailabilityZones)); err != nil {
-		return fmt.Errorf("[DEBUG] Error saving AvailabilityZones to state for RDS Cluster (%s): %s", d.Id(), err)
+		return fmt.Errorf("error setting availability_zones: %s", err)
 	}
+
+	d.Set("arn", dbc.DBClusterArn)
+	d.Set("backtrack_window", int(aws.Int64Value(dbc.BacktrackWindow)))
+	d.Set("backup_retention_period", dbc.BackupRetentionPeriod)
+	d.Set("cluster_identifier", dbc.DBClusterIdentifier)
+	d.Set("copy_tags_to_snapshot", dbc.CopyTagsToSnapshot)
+
+	var cm []string
+	for _, m := range dbc.DBClusterMembers {
+		cm = append(cm, aws.StringValue(m.DBInstanceIdentifier))
+	}
+	if err := d.Set("cluster_members", cm); err != nil {
+		return fmt.Errorf("error setting cluster_members: %s", err)
+	}
+
+	d.Set("cluster_resource_id", dbc.DbClusterResourceId)
 
 	// Only set the DatabaseName if it is not nil. There is a known API bug where
 	// RDS accepts a DatabaseName but does not return it, causing a perpetual
@@ -554,55 +1037,74 @@ func resourceAwsRDSClusterRead(d *schema.ResourceData, meta interface{}) error {
 		d.Set("database_name", dbc.DatabaseName)
 	}
 
-	d.Set("cluster_identifier", dbc.DBClusterIdentifier)
-	d.Set("cluster_resource_id", dbc.DbClusterResourceId)
-	d.Set("db_subnet_group_name", dbc.DBSubnetGroup)
 	d.Set("db_cluster_parameter_group_name", dbc.DBClusterParameterGroup)
+	d.Set("db_subnet_group_name", dbc.DBSubnetGroup)
+	d.Set("deletion_protection", dbc.DeletionProtection)
+
+	if err := d.Set("enabled_cloudwatch_logs_exports", aws.StringValueSlice(dbc.EnabledCloudwatchLogsExports)); err != nil {
+		return fmt.Errorf("error setting enabled_cloudwatch_logs_exports: %s", err)
+	}
+
 	d.Set("endpoint", dbc.Endpoint)
+	d.Set("engine_mode", dbc.EngineMode)
+	d.Set("engine_version", dbc.EngineVersion)
 	d.Set("engine", dbc.Engine)
-	d.Set("master_username", dbc.MasterUsername)
-	d.Set("port", dbc.Port)
-	d.Set("storage_encrypted", dbc.StorageEncrypted)
-	d.Set("backup_retention_period", dbc.BackupRetentionPeriod)
-	d.Set("preferred_backup_window", dbc.PreferredBackupWindow)
-	d.Set("preferred_maintenance_window", dbc.PreferredMaintenanceWindow)
-	d.Set("kms_key_id", dbc.KmsKeyId)
-	d.Set("reader_endpoint", dbc.ReaderEndpoint)
-	d.Set("replication_source_identifier", dbc.ReplicationSourceIdentifier)
+	d.Set("hosted_zone_id", dbc.HostedZoneId)
 	d.Set("iam_database_authentication_enabled", dbc.IAMDatabaseAuthenticationEnabled)
-
-	var vpcg []string
-	for _, g := range dbc.VpcSecurityGroups {
-		vpcg = append(vpcg, *g.VpcSecurityGroupId)
-	}
-	if err := d.Set("vpc_security_group_ids", vpcg); err != nil {
-		return fmt.Errorf("[DEBUG] Error saving VPC Security Group IDs to state for RDS Cluster (%s): %s", d.Id(), err)
-	}
-
-	var cm []string
-	for _, m := range dbc.DBClusterMembers {
-		cm = append(cm, *m.DBInstanceIdentifier)
-	}
-	if err := d.Set("cluster_members", cm); err != nil {
-		return fmt.Errorf("[DEBUG] Error saving RDS Cluster Members to state for RDS Cluster (%s): %s", d.Id(), err)
-	}
 
 	var roles []string
 	for _, r := range dbc.AssociatedRoles {
-		roles = append(roles, *r.RoleArn)
+		roles = append(roles, aws.StringValue(r.RoleArn))
 	}
-
 	if err := d.Set("iam_roles", roles); err != nil {
-		return fmt.Errorf("[DEBUG] Error saving IAM Roles to state for RDS Cluster (%s): %s", d.Id(), err)
+		return fmt.Errorf("error setting iam_roles: %s", err)
 	}
 
-	// Fetch and save tags
-	arn, err := buildRDSClusterARN(d.Id(), meta.(*AWSClient).partition, meta.(*AWSClient).accountid, meta.(*AWSClient).region)
+	d.Set("kms_key_id", dbc.KmsKeyId)
+	d.Set("master_username", dbc.MasterUsername)
+	d.Set("port", dbc.Port)
+	d.Set("preferred_backup_window", dbc.PreferredBackupWindow)
+	d.Set("preferred_maintenance_window", dbc.PreferredMaintenanceWindow)
+	d.Set("reader_endpoint", dbc.ReaderEndpoint)
+	d.Set("replication_source_identifier", dbc.ReplicationSourceIdentifier)
+
+	if err := d.Set("scaling_configuration", flattenRdsScalingConfigurationInfo(dbc.ScalingConfigurationInfo)); err != nil {
+		return fmt.Errorf("error setting scaling_configuration: %s", err)
+	}
+
+	d.Set("storage_encrypted", dbc.StorageEncrypted)
+	d.Set("enable_http_endpoint", dbc.HttpEndpointEnabled)
+
+	var vpcg []string
+	for _, g := range dbc.VpcSecurityGroups {
+		vpcg = append(vpcg, aws.StringValue(g.VpcSecurityGroupId))
+	}
+	if err := d.Set("vpc_security_group_ids", vpcg); err != nil {
+		return fmt.Errorf("error setting vpc_security_group_ids: %s", err)
+	}
+
+	tags, err := keyvaluetags.RdsListTags(conn, aws.StringValue(dbc.DBClusterArn))
 	if err != nil {
-		log.Printf("[DEBUG] Error building ARN for RDS Cluster (%s), not setting Tags", *dbc.DBClusterIdentifier)
-	} else {
-		if err := saveTagsRDS(conn, d, arn); err != nil {
-			log.Printf("[WARN] Failed to save tags for RDS Cluster (%s): %s", *dbc.DBClusterIdentifier, err)
+		return fmt.Errorf("error listing tags for RDS Cluster (%s): %s", aws.StringValue(dbc.DBClusterArn), err)
+	}
+	if err := d.Set("tags", tags.IgnoreAws().IgnoreConfig(ignoreTagsConfig).Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
+
+	// Fetch and save Global Cluster if engine mode global
+	d.Set("global_cluster_identifier", "")
+
+	if aws.StringValue(dbc.EngineMode) == "global" || aws.StringValue(dbc.EngineMode) == "provisioned" {
+		globalCluster, err := rdsDescribeGlobalClusterFromDbClusterARN(conn, aws.StringValue(dbc.DBClusterArn))
+
+		// Ignore the following API error for regions/partitions that do not support RDS Global Clusters:
+		// InvalidParameterValue: Access Denied to API Version: APIGlobalDatabases
+		if err != nil && !isAWSErr(err, "InvalidParameterValue", "Access Denied to API Version: APIGlobalDatabases") {
+			return fmt.Errorf("error reading RDS Global Cluster information for DB Cluster (%s): %s", d.Id(), err)
+		}
+
+		if globalCluster != nil {
+			d.Set("global_cluster_identifier", globalCluster.GlobalClusterIdentifier)
 		}
 	}
 
@@ -618,14 +1120,33 @@ func resourceAwsRDSClusterUpdate(d *schema.ResourceData, meta interface{}) error
 		DBClusterIdentifier: aws.String(d.Id()),
 	}
 
+	if v, ok := d.GetOk("allow_major_version_upgrade"); ok {
+		req.AllowMajorVersionUpgrade = aws.Bool(v.(bool))
+	}
+
+	if d.HasChange("backtrack_window") {
+		req.BacktrackWindow = aws.Int64(int64(d.Get("backtrack_window").(int)))
+		requestUpdate = true
+	}
+
+	if d.HasChange("copy_tags_to_snapshot") {
+		req.CopyTagsToSnapshot = aws.Bool(d.Get("copy_tags_to_snapshot").(bool))
+		requestUpdate = true
+	}
+
 	if d.HasChange("master_password") {
 		req.MasterUserPassword = aws.String(d.Get("master_password").(string))
 		requestUpdate = true
 	}
 
+	if d.HasChange("engine_version") {
+		req.EngineVersion = aws.String(d.Get("engine_version").(string))
+		requestUpdate = true
+	}
+
 	if d.HasChange("vpc_security_group_ids") {
 		if attr := d.Get("vpc_security_group_ids").(*schema.Set); attr.Len() > 0 {
-			req.VpcSecurityGroupIds = expandStringList(attr.List())
+			req.VpcSecurityGroupIds = expandStringSet(attr)
 		} else {
 			req.VpcSecurityGroupIds = []*string{}
 		}
@@ -648,8 +1169,12 @@ func resourceAwsRDSClusterUpdate(d *schema.ResourceData, meta interface{}) error
 	}
 
 	if d.HasChange("db_cluster_parameter_group_name") {
-		d.SetPartial("db_cluster_parameter_group_name")
 		req.DBClusterParameterGroupName = aws.String(d.Get("db_cluster_parameter_group_name").(string))
+		requestUpdate = true
+	}
+
+	if d.HasChange("deletion_protection") {
+		req.DeletionProtection = aws.Bool(d.Get("deletion_protection").(bool))
 		requestUpdate = true
 	}
 
@@ -658,20 +1183,87 @@ func resourceAwsRDSClusterUpdate(d *schema.ResourceData, meta interface{}) error
 		requestUpdate = true
 	}
 
+	if d.HasChange("enabled_cloudwatch_logs_exports") {
+		oraw, nraw := d.GetChange("enabled_cloudwatch_logs_exports")
+		o := oraw.(*schema.Set)
+		n := nraw.(*schema.Set)
+
+		enable := n.Difference(o)
+		disable := o.Difference(n)
+
+		req.CloudwatchLogsExportConfiguration = &rds.CloudwatchLogsExportConfiguration{
+			EnableLogTypes:  expandStringSet(enable),
+			DisableLogTypes: expandStringSet(disable),
+		}
+		requestUpdate = true
+	}
+
+	if d.HasChange("scaling_configuration") {
+		req.ScalingConfiguration = expandRdsClusterScalingConfiguration(d.Get("scaling_configuration").([]interface{}))
+		requestUpdate = true
+	}
+
+	if d.HasChange("enable_http_endpoint") {
+		req.EnableHttpEndpoint = aws.Bool(d.Get("enable_http_endpoint").(bool))
+		requestUpdate = true
+	}
+
 	if requestUpdate {
 		err := resource.Retry(5*time.Minute, func() *resource.RetryError {
 			_, err := conn.ModifyDBCluster(req)
 			if err != nil {
-				awsErr, ok := err.(awserr.Error)
-				if ok && awsErr.Code() == rds.ErrCodeInvalidDBClusterStateFault {
+				if isAWSErr(err, "InvalidParameterValue", "IAM role ARN value is invalid or does not include the required permissions") {
+					return resource.RetryableError(err)
+				}
+
+				if isAWSErr(err, rds.ErrCodeInvalidDBClusterStateFault, "Cannot modify engine version without a primary instance in DB cluster") {
+					return resource.NonRetryableError(err)
+				}
+
+				if isAWSErr(err, rds.ErrCodeInvalidDBClusterStateFault, "") {
 					return resource.RetryableError(err)
 				}
 				return resource.NonRetryableError(err)
 			}
 			return nil
 		})
+		if isResourceTimeoutError(err) {
+			_, err = conn.ModifyDBCluster(req)
+		}
 		if err != nil {
 			return fmt.Errorf("Failed to modify RDS Cluster (%s): %s", d.Id(), err)
+		}
+
+		log.Printf("[INFO] Waiting for RDS Cluster (%s) to be available", d.Id())
+		err = waitForRDSClusterUpdate(conn, d.Id(), d.Timeout(schema.TimeoutUpdate))
+		if err != nil {
+			return fmt.Errorf("error waiting for RDS Cluster (%s) to be available: %s", d.Id(), err)
+		}
+	}
+
+	if d.HasChange("global_cluster_identifier") {
+		oRaw, nRaw := d.GetChange("global_cluster_identifier")
+		o := oRaw.(string)
+		n := nRaw.(string)
+
+		if o == "" {
+			return errors.New("Existing RDS Clusters cannot be added to an existing RDS Global Cluster")
+		}
+
+		if n != "" {
+			return errors.New("Existing RDS Clusters cannot be migrated between existing RDS Global Clusters")
+		}
+
+		input := &rds.RemoveFromGlobalClusterInput{
+			DbClusterIdentifier:     aws.String(d.Get("arn").(string)),
+			GlobalClusterIdentifier: aws.String(o),
+		}
+
+		log.Printf("[DEBUG] Removing RDS Cluster from RDS Global Cluster: %s", input)
+		_, err := conn.RemoveFromGlobalCluster(input)
+
+		if err != nil && !tfawserr.ErrCodeEquals(err, rds.ErrCodeGlobalClusterNotFoundFault) && !tfawserr.ErrMessageContains(err, "InvalidParameterValue", "is not found in global cluster") {
+			return fmt.Errorf("error removing RDS Cluster (%s) from RDS Global Cluster: %s", d.Id(), err)
 		}
 	}
 
@@ -704,11 +1296,11 @@ func resourceAwsRDSClusterUpdate(d *schema.ResourceData, meta interface{}) error
 		}
 	}
 
-	if arn, err := buildRDSClusterARN(d.Id(), meta.(*AWSClient).partition, meta.(*AWSClient).accountid, meta.(*AWSClient).region); err == nil {
-		if err := setTagsRDS(conn, d, arn); err != nil {
-			return err
-		} else {
-			d.SetPartial("tags")
+	if d.HasChange("tags") {
+		o, n := d.GetChange("tags")
+
+		if err := keyvaluetags.RdsUpdateTags(conn, d.Get("arn").(string), o, n); err != nil {
+			return fmt.Errorf("error updating tags: %s", err)
 		}
 	}
 
@@ -719,6 +1311,22 @@ func resourceAwsRDSClusterDelete(d *schema.ResourceData, meta interface{}) error
 	conn := meta.(*AWSClient).rdsconn
 	log.Printf("[DEBUG] Destroying RDS Cluster (%s)", d.Id())
 
+	// Automatically remove from global cluster to bypass this error on deletion:
+	// InvalidDBClusterStateFault: This cluster is a part of a global cluster, please remove it from globalcluster first
+	if d.Get("global_cluster_identifier").(string) != "" {
+		input := &rds.RemoveFromGlobalClusterInput{
+			DbClusterIdentifier:     aws.String(d.Get("arn").(string)),
+			GlobalClusterIdentifier: aws.String(d.Get("global_cluster_identifier").(string)),
+		}
+
+		log.Printf("[DEBUG] Removing RDS Cluster from RDS Global Cluster: %s", input)
+		_, err := conn.RemoveFromGlobalCluster(input)
+
+		if err != nil && !tfawserr.ErrCodeEquals(err, rds.ErrCodeGlobalClusterNotFoundFault) && !tfawserr.ErrMessageContains(err, "InvalidParameterValue", "is not found in global cluster") {
+			return fmt.Errorf("error removing RDS Cluster (%s) from RDS Global Cluster: %s", d.Id(), err)
+		}
+	}
+
 	deleteOpts := rds.DeleteDBClusterInput{
 		DBClusterIdentifier: aws.String(d.Id()),
 	}
@@ -726,7 +1334,7 @@ func resourceAwsRDSClusterDelete(d *schema.ResourceData, meta interface{}) error
 	skipFinalSnapshot := d.Get("skip_final_snapshot").(bool)
 	deleteOpts.SkipFinalSnapshot = aws.Bool(skipFinalSnapshot)
 
-	if skipFinalSnapshot == false {
+	if !skipFinalSnapshot {
 		if name, present := d.GetOk("final_snapshot_identifier"); present {
 			deleteOpts.FinalDBSnapshotIdentifier = aws.String(name.(string))
 		} else {
@@ -735,56 +1343,57 @@ func resourceAwsRDSClusterDelete(d *schema.ResourceData, meta interface{}) error
 	}
 
 	log.Printf("[DEBUG] RDS Cluster delete options: %s", deleteOpts)
-	_, err := conn.DeleteDBCluster(&deleteOpts)
-	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if "InvalidDBClusterStateFault" == awsErr.Code() {
-				return fmt.Errorf("RDS Cluster cannot be deleted: %s", awsErr.Message())
+
+	err := resource.Retry(rdsClusterTimeoutDelete, func() *resource.RetryError {
+		_, err := conn.DeleteDBCluster(&deleteOpts)
+		if err != nil {
+			if isAWSErr(err, rds.ErrCodeInvalidDBClusterStateFault, "is not currently in the available state") {
+				return resource.RetryableError(err)
 			}
+			if isAWSErr(err, rds.ErrCodeInvalidDBClusterStateFault, "cluster is a part of a global cluster") {
+				return resource.RetryableError(err)
+			}
+			if isAWSErr(err, rds.ErrCodeDBClusterNotFoundFault, "") {
+				return nil
+			}
+			return resource.NonRetryableError(err)
 		}
+		return nil
+	})
+
+	if isResourceTimeoutError(err) {
+		_, err = conn.DeleteDBCluster(&deleteOpts)
 	}
 
-	stateConf := &resource.StateChangeConf{
-		Pending:    []string{"available", "deleting", "backing-up", "modifying"},
-		Target:     []string{"destroyed"},
-		Refresh:    resourceAwsRDSClusterStateRefreshFunc(d, meta),
-		Timeout:    d.Timeout(schema.TimeoutDelete),
-		MinTimeout: 10 * time.Second,
-		Delay:      30 * time.Second,
-	}
-
-	// Wait, catching any errors
-	_, err = stateConf.WaitForState()
 	if err != nil {
-		return fmt.Errorf("[WARN] Error deleting RDS Cluster (%s): %s", d.Id(), err)
+		return fmt.Errorf("error deleting RDS Cluster (%s): %s", d.Id(), err)
+	}
+
+	if err := waitForRDSClusterDeletion(conn, d.Id(), d.Timeout(schema.TimeoutDelete)); err != nil {
+		return fmt.Errorf("error waiting for RDS Cluster (%s) deletion: %s", d.Id(), err)
 	}
 
 	return nil
 }
 
-func resourceAwsRDSClusterStateRefreshFunc(
-	d *schema.ResourceData, meta interface{}) resource.StateRefreshFunc {
+func resourceAwsRDSClusterStateRefreshFunc(conn *rds.RDS, dbClusterIdentifier string) resource.StateRefreshFunc {
 	return func() (interface{}, string, error) {
-		conn := meta.(*AWSClient).rdsconn
-
 		resp, err := conn.DescribeDBClusters(&rds.DescribeDBClustersInput{
-			DBClusterIdentifier: aws.String(d.Id()),
+			DBClusterIdentifier: aws.String(dbClusterIdentifier),
 		})
 
+		if isAWSErr(err, rds.ErrCodeDBClusterNotFoundFault, "") {
+			return 42, "destroyed", nil
+		}
+
 		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				if "DBClusterNotFoundFault" == awsErr.Code() {
-					return 42, "destroyed", nil
-				}
-			}
-			log.Printf("[WARN] Error on retrieving DB Cluster (%s) when waiting: %s", d.Id(), err)
 			return nil, "", err
 		}
 
 		var dbc *rds.DBCluster
 
 		for _, c := range resp.DBClusters {
-			if *c.DBClusterIdentifier == d.Id() {
+			if *c.DBClusterIdentifier == dbClusterIdentifier {
 				dbc = c
 			}
 		}
@@ -794,24 +1403,11 @@ func resourceAwsRDSClusterStateRefreshFunc(
 		}
 
 		if dbc.Status != nil {
-			log.Printf("[DEBUG] DB Cluster status (%s): %s", d.Id(), *dbc.Status)
+			log.Printf("[DEBUG] DB Cluster status (%s): %s", dbClusterIdentifier, *dbc.Status)
 		}
 
-		return dbc, *dbc.Status, nil
+		return dbc, aws.StringValue(dbc.Status), nil
 	}
-}
-
-func buildRDSClusterARN(identifier, partition, accountid, region string) (string, error) {
-	if partition == "" {
-		return "", fmt.Errorf("Unable to construct RDS Cluster ARN because of missing AWS partition")
-	}
-	if accountid == "" {
-		return "", fmt.Errorf("Unable to construct RDS Cluster ARN because of missing AWS Account ID")
-	}
-
-	arn := fmt.Sprintf("arn:%s:rds:%s:%s:cluster:%s", partition, region, accountid, identifier)
-	return arn, nil
-
 }
 
 func setIamRoleToRdsCluster(clusterIdentifier string, roleArn string, conn *rds.RDS) error {
@@ -820,11 +1416,7 @@ func setIamRoleToRdsCluster(clusterIdentifier string, roleArn string, conn *rds.
 		RoleArn:             aws.String(roleArn),
 	}
 	_, err := conn.AddRoleToDBCluster(params)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func removeIamRoleFromRdsCluster(clusterIdentifier string, roleArn string, conn *rds.RDS) error {
@@ -833,9 +1425,56 @@ func removeIamRoleFromRdsCluster(clusterIdentifier string, roleArn string, conn 
 		RoleArn:             aws.String(roleArn),
 	}
 	_, err := conn.RemoveRoleFromDBCluster(params)
-	if err != nil {
-		return err
+	return err
+}
+
+var resourceAwsRdsClusterCreatePendingStates = []string{
+	"creating",
+	"backing-up",
+	"modifying",
+	"preparing-data-migration",
+	"migrating",
+	"resetting-master-credentials",
+}
+
+var resourceAwsRdsClusterDeletePendingStates = []string{
+	"available",
+	"deleting",
+	"backing-up",
+	"modifying",
+}
+
+var resourceAwsRdsClusterUpdatePendingStates = []string{
+	"backing-up",
+	"modifying",
+	"resetting-master-credentials",
+	"upgrading",
+}
+
+func waitForRDSClusterUpdate(conn *rds.RDS, id string, timeout time.Duration) error {
+	stateConf := &resource.StateChangeConf{
+		Pending:    resourceAwsRdsClusterUpdatePendingStates,
+		Target:     []string{"available"},
+		Refresh:    resourceAwsRDSClusterStateRefreshFunc(conn, id),
+		Timeout:    timeout,
+		MinTimeout: 10 * time.Second,
+		Delay:      30 * time.Second, // Wait 30 secs before starting
+	}
+	_, err := stateConf.WaitForState()
+	return err
+}
+
+func waitForRDSClusterDeletion(conn *rds.RDS, id string, timeout time.Duration) error {
+	stateConf := &resource.StateChangeConf{
+		Pending:    resourceAwsRdsClusterDeletePendingStates,
+		Target:     []string{"destroyed"},
+		Refresh:    resourceAwsRDSClusterStateRefreshFunc(conn, id),
+		Timeout:    timeout,
+		MinTimeout: 10 * time.Second,
+		Delay:      30 * time.Second,
 	}
 
-	return nil
+	_, err := stateConf.WaitForState()
+
+	return err
 }

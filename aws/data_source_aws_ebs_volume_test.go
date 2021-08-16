@@ -4,20 +4,28 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
 func TestAccAWSEbsVolumeDataSource_basic(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	resourceName := "aws_ebs_volume.test"
+	dataSourceName := "data.aws_ebs_volume.test"
+
+	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:  func() { testAccPreCheck(t) },
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
 			{
 				Config: testAccCheckAwsEbsVolumeDataSourceConfig,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckAwsEbsVolumeDataSourceID("data.aws_ebs_volume.ebs_volume"),
-					resource.TestCheckResourceAttr("data.aws_ebs_volume.ebs_volume", "size", "40"),
+					testAccCheckAwsEbsVolumeDataSourceID(dataSourceName),
+					resource.TestCheckResourceAttrPair(dataSourceName, "arn", resourceName, "arn"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "size", resourceName, "size"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "tags", resourceName, "tags"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "outpost_arn", resourceName, "outpost_arn"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "multi_attach_enabled", resourceName, "multi_attach_enabled"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "throughput", resourceName, "throughput"),
 				),
 			},
 		},
@@ -25,16 +33,20 @@ func TestAccAWSEbsVolumeDataSource_basic(t *testing.T) {
 }
 
 func TestAccAWSEbsVolumeDataSource_multipleFilters(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	resourceName := "aws_ebs_volume.test"
+	dataSourceName := "data.aws_ebs_volume.test"
+
+	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:  func() { testAccPreCheck(t) },
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
 			{
 				Config: testAccCheckAwsEbsVolumeDataSourceConfigWithMultipleFilters,
 				Check: resource.ComposeTestCheckFunc(
-					testAccCheckAwsEbsVolumeDataSourceID("data.aws_ebs_volume.ebs_volume"),
-					resource.TestCheckResourceAttr("data.aws_ebs_volume.ebs_volume", "size", "10"),
-					resource.TestCheckResourceAttr("data.aws_ebs_volume.ebs_volume", "volume_type", "gp2"),
+					testAccCheckAwsEbsVolumeDataSourceID(dataSourceName),
+					resource.TestCheckResourceAttrPair(dataSourceName, "size", resourceName, "size"),
+					resource.TestCheckResourceAttr(dataSourceName, "volume_type", "gp2"),
+					resource.TestCheckResourceAttrPair(dataSourceName, "tags", resourceName, "tags"),
 				),
 			},
 		},
@@ -55,52 +67,59 @@ func testAccCheckAwsEbsVolumeDataSourceID(n string) resource.TestCheckFunc {
 	}
 }
 
-const testAccCheckAwsEbsVolumeDataSourceConfig = `
-resource "aws_ebs_volume" "example" {
-    availability_zone = "us-west-2a"
-    type = "gp2"
-    size = 40
-    tags {
-        Name = "External Volume"
-    }
+var testAccCheckAwsEbsVolumeDataSourceConfig = testAccAvailableAZsNoOptInConfig() + `
+resource "aws_ebs_volume" "test" {
+  availability_zone = data.aws_availability_zones.available.names[0]
+  type              = "gp2"
+  size              = 40
+
+  tags = {
+    Name = "External Volume"
+  }
 }
 
-data "aws_ebs_volume" "ebs_volume" {
-    most_recent = true
-    filter {
-	name = "tag:Name"
-	values = ["External Volume"]
-    }
-    filter {
-	name = "volume-type"
-	values = ["${aws_ebs_volume.example.type}"]
-    }
+data "aws_ebs_volume" "test" {
+  most_recent = true
+
+  filter {
+    name   = "tag:Name"
+    values = ["External Volume"]
+  }
+
+  filter {
+    name   = "volume-type"
+    values = [aws_ebs_volume.test.type]
+  }
 }
 `
 
-const testAccCheckAwsEbsVolumeDataSourceConfigWithMultipleFilters = `
-resource "aws_ebs_volume" "external1" {
-    availability_zone = "us-west-2a"
-    type = "gp2"
-    size = 10
-    tags {
-        Name = "External Volume 1"
-    }
+var testAccCheckAwsEbsVolumeDataSourceConfigWithMultipleFilters = testAccAvailableAZsNoOptInConfig() + `
+resource "aws_ebs_volume" "test" {
+  availability_zone = data.aws_availability_zones.available.names[0]
+  type              = "gp2"
+  size              = 10
+
+  tags = {
+    Name = "External Volume 1"
+  }
 }
 
-data "aws_ebs_volume" "ebs_volume" {
-    most_recent = true
-    filter {
-	name = "tag:Name"
-	values = ["External Volume 1"]
-    }
-    filter {
-	name = "size"
-	values = ["${aws_ebs_volume.external1.size}"]
-    }
-    filter {
-	name = "volume-type"
-	values = ["${aws_ebs_volume.external1.type}"]
-    }
+data "aws_ebs_volume" "test" {
+  most_recent = true
+
+  filter {
+    name   = "tag:Name"
+    values = ["External Volume 1"]
+  }
+
+  filter {
+    name   = "size"
+    values = [aws_ebs_volume.test.size]
+  }
+
+  filter {
+    name   = "volume-type"
+    values = [aws_ebs_volume.test.type]
+  }
 }
 `

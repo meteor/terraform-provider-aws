@@ -1,12 +1,12 @@
 ---
+subcategory: "ElastiCache"
 layout: "aws"
 page_title: "AWS: aws_elasticache_subnet_group"
-sidebar_current: "docs-aws-resource-elasticache-subnet-group"
 description: |-
   Provides an ElastiCache Subnet Group resource.
 ---
 
-# aws\_elasticache\_subnet\_group
+# Resource: aws_elasticache_subnet_group
 
 Provides an ElastiCache Subnet Group resource.
 
@@ -20,24 +20,24 @@ ElastiCache cluster **inside** of a VPC. If you are on EC2 Classic, see the
 resource "aws_vpc" "foo" {
   cidr_block = "10.0.0.0/16"
 
-  tags {
+  tags = {
     Name = "tf-test"
   }
 }
 
 resource "aws_subnet" "foo" {
-  vpc_id            = "${aws_vpc.foo.id}"
+  vpc_id            = aws_vpc.foo.id
   cidr_block        = "10.0.0.0/24"
   availability_zone = "us-west-2a"
 
-  tags {
+  tags = {
     Name = "tf-test"
   }
 }
 
 resource "aws_elasticache_subnet_group" "bar" {
   name       = "tf-test-cache-subnet"
-  subnet_ids = ["${aws_subnet.foo.id}"]
+  subnet_ids = [aws_subnet.foo.id]
 }
 ```
 
@@ -51,7 +51,7 @@ The following arguments are supported:
 
 ## Attributes Reference
 
-The following attributes are exported:
+In addition to all arguments above, the following attributes are exported:
 
 * `description`
 * `name`

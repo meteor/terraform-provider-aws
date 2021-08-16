@@ -10,8 +10,8 @@ the example's own directory.
 For example:
 
 ```
-$ git clone https://github.com/terraform-providers/terraform-provider-aws
-$ cd terraform-provider-aws/examples/aws-two-tier
+$ git clone https://github.com/hashicorp/terraform-provider-aws
+$ cd terraform-provider-aws/examples/two-tier
 $ terraform apply
 ...
 ```

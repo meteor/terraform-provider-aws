@@ -1,12 +1,12 @@
 ---
+subcategory: "CloudFront"
 layout: "aws"
-page_title: "AWS: cloudfront_origin_access_identity"
-sidebar_current: "docs-aws-resource-cloudfront-origin-access-identity"
+page_title: "AWS: aws_cloudfront_origin_access_identity"
 description: |-
   Provides a CloudFront origin access identity.
 ---
 
-# aws\_cloudfront\_origin\_access\_identity
+# Resource: aws_cloudfront_origin_access_identity
 
 Creates an Amazon CloudFront origin access identity.
 
@@ -29,9 +29,9 @@ resource "aws_cloudfront_origin_access_identity" "origin_access_identity" {
 
 * `comment` (Optional) - An optional comment for the origin access identity.
 
-## Attribute Reference
+## Attributes Reference
 
-The following attributes are exported:
+In addition to all arguments above, the following attributes are exported:
 
 * `id` - The identifier for the distribution. For example: `EDFDVBD632BHDS5`.
 * `caller_reference` - Internal value used by CloudFront to allow future
@@ -53,11 +53,17 @@ Normally, when referencing an origin access identity in CloudFront, you need to
 prefix the ID with the `origin-access-identity/cloudfront/` special path.
 The `cloudfront_access_identity_path` allows this to be circumvented.
 The below snippet demonstrates use with the `s3_origin_config` structure for the
-[`aws_cloudfront_web_distribution`][3] resource:
+[`aws_cloudfront_distribution`][3] resource:
 
 ```hcl
-s3_origin_config {
-  origin_access_identity = "${aws_cloudfront_origin_access_identity.origin_access_identity.cloudfront_access_identity_path}"
+resource "aws_cloudfront_distribution" "example" {
+  # ... other configuration ...
+
+  origin {
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.example.cloudfront_access_identity_path
+    }
+  }
 }
 ```
 
@@ -72,28 +78,18 @@ you see this behaviour, use the `iam_arn` instead:
 data "aws_iam_policy_document" "s3_policy" {
   statement {
     actions   = ["s3:GetObject"]
-    resources = ["${module.names.s3_endpoint_arn_base}/*"]
+    resources = ["${aws_s3_bucket.example.arn}/*"]
 
     principals {
       type        = "AWS"
-      identifiers = ["${aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn}"]
-    }
-  }
-
-  statement {
-    actions   = ["s3:ListBucket"]
-    resources = ["${module.names.s3_endpoint_arn_base}"]
-
-    principals {
-      type        = "AWS"
-      identifiers = ["${aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn}"]
+      identifiers = [aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn]
     }
   }
 }
 
-resource "aws_s3_bucket" "bucket" {
-  # ...
-  policy = "${data.aws_iam_policy_document.s3_policy.json}"
+resource "aws_s3_bucket_policy" "example" {
+  bucket = aws_s3_bucket.example.id
+  policy = data.aws_iam_policy_document.s3_policy.json
 }
 ```
 

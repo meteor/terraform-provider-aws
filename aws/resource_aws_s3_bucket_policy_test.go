@@ -6,20 +6,35 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/hashicorp/terraform/helper/acctest"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/jen20/awspolicyequivalence"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	awspolicy "github.com/jen20/awspolicyequivalence"
 )
 
 func TestAccAWSS3BucketPolicy_basic(t *testing.T) {
 	name := fmt.Sprintf("tf-test-bucket-%d", acctest.RandInt())
+	partition := testAccGetPartition()
 
-	expectedPolicyText := fmt.Sprintf(
-		`{"Version":"2012-10-17","Statement":[{"Sid": "", "Effect":"Allow","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::%s/*","arn:aws:s3:::%s"]}]}`,
-		name, name)
+	expectedPolicyText := fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": "s3:*",
+      "Resource": [
+        "arn:%s:s3:::%s/*",
+        "arn:%s:s3:::%s"
+      ]
+    }
+  ]
+}`, partition, name, partition, name)
 
-	resource.Test(t, resource.TestCase{
+	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSS3BucketDestroy,
@@ -31,22 +46,60 @@ func TestAccAWSS3BucketPolicy_basic(t *testing.T) {
 					testAccCheckAWSS3BucketHasPolicy("aws_s3_bucket.bucket", expectedPolicyText),
 				),
 			},
+			{
+				ResourceName:      "aws_s3_bucket_policy.bucket",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
 		},
 	})
 }
 
 func TestAccAWSS3BucketPolicy_policyUpdate(t *testing.T) {
 	name := fmt.Sprintf("tf-test-bucket-%d", acctest.RandInt())
+	partition := testAccGetPartition()
 
-	expectedPolicyText1 := fmt.Sprintf(
-		`{"Version":"2012-10-17","Statement":[{"Sid": "", "Effect":"Allow","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::%s/*","arn:aws:s3:::%s"]}]}`,
-		name, name)
+	expectedPolicyText1 := fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": "s3:*",
+      "Resource": [
+        "arn:%[1]s:s3:::%[2]s/*",
+        "arn:%[1]s:s3:::%[2]s"
+      ]
+    }
+  ]
+}`, partition, name)
 
-	expectedPolicyText2 := fmt.Sprintf(
-		`{"Version":"2012-10-17","Statement":[{"Sid": "", "Effect":"Allow","Principal":"*","Action":["s3:DeleteBucket", "s3:ListBucket", "s3:ListBucketVersions"], "Resource":["arn:aws:s3:::%s/*","arn:aws:s3:::%s"]}]}`,
-		name, name)
+	expectedPolicyText2 := fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": [
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": [
+        "arn:%[1]s:s3:::%[2]s/*",
+        "arn:%[1]s:s3:::%[2]s"
+      ]
+    }
+  ]
+}`, partition, name)
 
-	resource.Test(t, resource.TestCase{
+	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSS3BucketDestroy,
@@ -65,6 +118,12 @@ func TestAccAWSS3BucketPolicy_policyUpdate(t *testing.T) {
 					testAccCheckAWSS3BucketExists("aws_s3_bucket.bucket"),
 					testAccCheckAWSS3BucketHasPolicy("aws_s3_bucket.bucket", expectedPolicyText2),
 				),
+			},
+
+			{
+				ResourceName:      "aws_s3_bucket_policy.bucket",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
@@ -108,15 +167,16 @@ func testAccCheckAWSS3BucketHasPolicy(n string, expectedPolicyText string) resou
 func testAccAWSS3BucketPolicyConfig(bucketName string) string {
 	return fmt.Sprintf(`
 resource "aws_s3_bucket" "bucket" {
-	bucket = "%s"
-	tags {
-		TestName = "TestAccAWSS3BucketPolicy_basic"
-	}
+  bucket = "%s"
+
+  tags = {
+    TestName = "TestAccAWSS3BucketPolicy_basic"
+  }
 }
 
 resource "aws_s3_bucket_policy" "bucket" {
-	bucket = "${aws_s3_bucket.bucket.bucket}"
-	policy = "${data.aws_iam_policy_document.policy.json}"
+  bucket = aws_s3_bucket.bucket.bucket
+  policy = data.aws_iam_policy_document.policy.json
 }
 
 data "aws_iam_policy_document" "policy" {
@@ -128,7 +188,7 @@ data "aws_iam_policy_document" "policy" {
     ]
 
     resources = [
-      "${aws_s3_bucket.bucket.arn}",
+      aws_s3_bucket.bucket.arn,
       "${aws_s3_bucket.bucket.arn}/*",
     ]
 
@@ -144,15 +204,16 @@ data "aws_iam_policy_document" "policy" {
 func testAccAWSS3BucketPolicyConfig_updated(bucketName string) string {
 	return fmt.Sprintf(`
 resource "aws_s3_bucket" "bucket" {
-	bucket = "%s"
-	tags {
-		TestName = "TestAccAWSS3BucketPolicy_basic"
-	}
+  bucket = "%s"
+
+  tags = {
+    TestName = "TestAccAWSS3BucketPolicy_basic"
+  }
 }
 
 resource "aws_s3_bucket_policy" "bucket" {
-	bucket = "${aws_s3_bucket.bucket.bucket}"
-	policy = "${data.aws_iam_policy_document.policy.json}"
+  bucket = aws_s3_bucket.bucket.bucket
+  policy = data.aws_iam_policy_document.policy.json
 }
 
 data "aws_iam_policy_document" "policy" {
@@ -162,11 +223,11 @@ data "aws_iam_policy_document" "policy" {
     actions = [
       "s3:DeleteBucket",
       "s3:ListBucket",
-      "s3:ListBucketVersions"
+      "s3:ListBucketVersions",
     ]
 
     resources = [
-      "${aws_s3_bucket.bucket.arn}",
+      aws_s3_bucket.bucket.arn,
       "${aws_s3_bucket.bucket.arn}/*",
     ]
 

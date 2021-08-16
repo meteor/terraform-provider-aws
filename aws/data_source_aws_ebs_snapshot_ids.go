@@ -2,10 +2,12 @@ package aws
 
 import (
 	"fmt"
+	"log"
+	"sort"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/hashicorp/terraform/helper/hashcode"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 func dataSourceAwsEbsSnapshotIds() *schema.Resource {
@@ -17,17 +19,14 @@ func dataSourceAwsEbsSnapshotIds() *schema.Resource {
 			"owners": {
 				Type:     schema.TypeList,
 				Optional: true,
-				ForceNew: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
 			"restorable_by_user_ids": {
 				Type:     schema.TypeList,
 				Optional: true,
-				ForceNew: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
-			"tags": dataSourceTagsSchema(),
-			"ids": &schema.Schema{
+			"ids": {
 				Type:     schema.TypeList,
 				Computed: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
@@ -43,7 +42,7 @@ func dataSourceAwsEbsSnapshotIdsRead(d *schema.ResourceData, meta interface{}) e
 	filters, filtersOk := d.GetOk("filter")
 	owners, ownersOk := d.GetOk("owners")
 
-	if restorableUsers == false && filtersOk == false && ownersOk == false {
+	if restorableUsers == false && !filtersOk && !ownersOk {
 		return fmt.Errorf("One of filters, restorable_by_user_ids, or owners must be assigned")
 	}
 
@@ -59,6 +58,7 @@ func dataSourceAwsEbsSnapshotIdsRead(d *schema.ResourceData, meta interface{}) e
 		params.OwnerIds = expandStringList(owners.([]interface{}))
 	}
 
+	log.Printf("[DEBUG] Reading EBS Snapshot IDs: %s", params)
 	resp, err := conn.DescribeSnapshots(params)
 	if err != nil {
 		return err
@@ -66,11 +66,15 @@ func dataSourceAwsEbsSnapshotIdsRead(d *schema.ResourceData, meta interface{}) e
 
 	snapshotIds := make([]string, 0)
 
-	for _, snapshot := range sortSnapshots(resp.Snapshots) {
+	sort.Slice(resp.Snapshots, func(i, j int) bool {
+		return aws.TimeValue(resp.Snapshots[i].StartTime).Unix() > aws.TimeValue(resp.Snapshots[j].StartTime).Unix()
+	})
+	for _, snapshot := range resp.Snapshots {
 		snapshotIds = append(snapshotIds, *snapshot.SnapshotId)
 	}
 
-	d.SetId(fmt.Sprintf("%d", hashcode.String(params.String())))
+	d.SetId(meta.(*AWSClient).region)
+
 	d.Set("ids", snapshotIds)
 
 	return nil

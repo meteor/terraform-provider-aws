@@ -9,7 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
-var resourceUniqueIDSuffixRegexpPattern = fmt.Sprintf("[[:xdigit:]]{%d}$", resource.UniqueIDSuffixLength)
+var resourceUniqueIDSuffixRegexpPattern = fmt.Sprintf("[0-9A-Za-z]{%d}$", resource.UniqueIDSuffixLength)
 var resourceUniqueIDSuffixRegexp = regexp.MustCompile(resourceUniqueIDSuffixRegexpPattern)
 
 var resourceUniqueIDRegexpPattern = resourcePrefixedUniqueIDRegexpPattern(resource.UniqueIdPrefix)
